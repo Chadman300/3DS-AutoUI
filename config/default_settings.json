@@ -1,0 +1,25 @@
+{
+  "vehicle_name": "Subaru WRX 2010",
+  "accent_color": "#FF5A36",
+  "brand_logo": "subaru",
+  "theme": {
+    "background": "#0B1220",
+    "panel": "#111827",
+    "foreground": "#E5E7EB",
+    "accent": "#FF5A36",
+    "warning": "#FBBF24",
+    "critical": "#EF4444",
+    "success": "#34D399",
+    "secondary": "#60A5FA"
+  },
+  "gauges": [
+    {"id": "rpm", "label": "RPM", "unit": "RPM", "min": 0, "max": 8000, "warning": 6500, "critical": 7200, "color": "#FF5A36", "enabled": true},
+    {"id": "speed", "label": "Speed", "unit": "MPH", "min": 0, "max": 140, "warning": 110, "critical": 130, "color": "#60A5FA", "enabled": true},
+    {"id": "coolant_temp", "label": "Coolant", "unit": "C", "min": 0, "max": 130, "warning": 95, "critical": 110, "color": "#FBBF24", "enabled": true},
+    {"id": "boost", "label": "Boost", "unit": "psi", "min": -5, "max": 25, "warning": 18, "critical": 22, "color": "#34D399", "enabled": true},
+    {"id": "battery_voltage", "label": "Voltage", "unit": "V", "min": 10, "max": 15, "warning": 11.5, "critical": 10.5, "color": "#A78BFA", "enabled": true},
+    {"id": "throttle_position", "label": "Throttle", "unit": "%", "min": 0, "max": 100, "warning": 85, "critical": 95, "color": "#F472B6", "enabled": true},
+    {"id": "engine_load", "label": "Load", "unit": "%", "min": 0, "max": 100, "warning": 80, "critical": 95, "color": "#22D3EE", "enabled": true},
+    {"id": "fuel_level", "label": "Fuel", "unit": "%", "min": 0, "max": 100, "warning": 15, "critical": 8, "color": "#FCD34D", "enabled": true}
+  ]
+}

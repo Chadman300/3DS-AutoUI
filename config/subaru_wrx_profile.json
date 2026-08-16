@@ -1,0 +1,104 @@
+{
+  "vehicle": {
+    "make": "Subaru",
+    "model": "WRX",
+    "year": 2010,
+    "platform": "2.5L turbo",
+    "interface": "OBD2/ELM327",
+    "logo": "subaru",
+    "theme": "wrx-rally"
+  },
+  "theme": {
+    "name": "wrx-rally",
+    "background": "#0B1220",
+    "panel": "#111827",
+    "foreground": "#E5E7EB",
+    "accent": "#FF5A36",
+    "warning": "#FBBF24",
+    "critical": "#EF4444",
+    "success": "#34D399",
+    "secondary": "#60A5FA"
+  },
+  "gauges": [
+    {
+      "id": "rpm",
+      "label": "RPM",
+      "unit": "RPM",
+      "min": 0,
+      "max": 8000,
+      "warning": 6500,
+      "critical": 7200,
+      "color": "#FF5A36"
+    },
+    {
+      "id": "speed",
+      "label": "Speed",
+      "unit": "MPH",
+      "min": 0,
+      "max": 140,
+      "warning": 110,
+      "critical": 130,
+      "color": "#60A5FA"
+    },
+    {
+      "id": "coolant_temp",
+      "label": "Coolant",
+      "unit": "C",
+      "min": 0,
+      "max": 130,
+      "warning": 95,
+      "critical": 110,
+      "color": "#FBBF24"
+    },
+    {
+      "id": "boost",
+      "label": "Boost",
+      "unit": "psi",
+      "min": -5,
+      "max": 25,
+      "warning": 18,
+      "critical": 22,
+      "color": "#34D399"
+    },
+    {
+      "id": "battery_voltage",
+      "label": "Voltage",
+      "unit": "V",
+      "min": 10,
+      "max": 15,
+      "warning": 11.5,
+      "critical": 10.5,
+      "color": "#A78BFA"
+    },
+    {
+      "id": "throttle_position",
+      "label": "Throttle",
+      "unit": "%",
+      "min": 0,
+      "max": 100,
+      "warning": 85,
+      "critical": 95,
+      "color": "#F472B6"
+    },
+    {
+      "id": "engine_load",
+      "label": "Load",
+      "unit": "%",
+      "min": 0,
+      "max": 100,
+      "warning": 80,
+      "critical": 95,
+      "color": "#22D3EE"
+    },
+    {
+      "id": "fuel_level",
+      "label": "Fuel",
+      "unit": "%",
+      "min": 0,
+      "max": 100,
+      "warning": 15,
+      "critical": 8,
+      "color": "#FCD34D"
+    }
+  ]
+}

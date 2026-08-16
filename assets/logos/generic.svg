@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 120" width="320" height="120">
+  <rect width="320" height="120" fill="#111827"/>
+  <circle cx="60" cy="60" r="38" fill="none" stroke="#E5E7EB" stroke-width="6"/>
+  <path d="M36 80 L48 40 L60 80 L72 40 L84 80" fill="none" stroke="#E5E7EB" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="118" y="72" font-family="Arial, Helvetica, sans-serif" font-size="30" fill="#E5E7EB" font-weight="700">GENERIC</text>
+</svg>

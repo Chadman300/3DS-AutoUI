@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 120" width="320" height="120">
+  <rect width="320" height="120" fill="#0B1220"/>
+  <circle cx="60" cy="60" r="42" fill="none" stroke="#E5E7EB" stroke-width="6"/>
+  <path d="M32 76 L52 44 L70 76 L86 44 L60 76 L42 64 L32 76 Z" fill="#E5E7EB"/>
+  <text x="120" y="72" font-family="Arial, Helvetica, sans-serif" font-size="36" fill="#E5E7EB" font-weight="700">SUBARU</text>
+</svg>
