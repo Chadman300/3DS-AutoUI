@@ -3,16 +3,29 @@
 #include "gui_renderer.hpp"
 #include <cstdio>
 #include <string>
+#include <sys/stat.h>
 
-// Stub implementations for settings persistence.
-// In a full implementation, these would save/load from SD card.
+// Persists settings (including the OBD adapter's IP) as a raw struct dump on the SD card,
+// so the adapter host can be changed without rebuilding the app.
+inline const char* settingsPath() {
+    return "sdmc:/3ds/3ds_autoui/settings.bin";
+}
 
 inline void loadSettings(GuiSettings& settings) {
-    // TODO: Load from SD card
-    // For now, just use defaults (set in GuiSettings constructor)
+    FILE* file = fopen(settingsPath(), "rb");
+    if (file == nullptr) return;
+    GuiSettings loaded;
+    if (fread(&loaded, sizeof(GuiSettings), 1, file) == 1) {
+        settings = loaded;
+    }
+    fclose(file);
 }
 
 inline void saveSettings(const GuiSettings& settings) {
-    // TODO: Save to SD card
-    // For now, just no-op
+    mkdir("sdmc:/3ds", 0777);
+    mkdir("sdmc:/3ds/3ds_autoui", 0777);
+    FILE* file = fopen(settingsPath(), "wb");
+    if (file == nullptr) return;
+    fwrite(&settings, sizeof(GuiSettings), 1, file);
+    fclose(file);
 }

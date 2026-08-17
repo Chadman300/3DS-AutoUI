@@ -276,6 +276,8 @@ int main(int argc, char** argv) {
     };
 
     ObdConnectionConfig obdConfig;
+    obdConfig.host = settings.host;
+    obdConfig.port = static_cast<u16>(settings.port);
     ObdClient obd(obdConfig);
     std::string localIp = "unknown";
     // Give the Wi-Fi stack a moment to settle before giving up on the first attempt.
@@ -316,8 +318,24 @@ int main(int argc, char** argv) {
             settings.background = backgrounds[settings.theme];
         }
         if (keys & KEY_Y) {
-            static const unsigned int accents[] = {0xFF5A36, 0x60A5FA, 0x34D399, 0xF472B6};
-            settings.accent = accents[(settings.theme + 1) % 4];
+            if (!liveMode && networkReady) {
+                char buffer[16];
+                snprintf(buffer, sizeof(buffer), "%s", settings.host);
+                SwkbdState swkbd;
+                swkbdInit(&swkbd, SWKBD_TYPE_NORMAL, 2, 15);
+                swkbdSetHintText(&swkbd, "Adapter IP e.g. 172.20.10.2");
+                SwkbdButton button = swkbdInputText(&swkbd, buffer, sizeof(buffer));
+                if (button != SWKBD_BUTTON_NONE && buffer[0] != '\0') {
+                    snprintf(settings.host, sizeof(settings.host), "%s", buffer);
+                    obdConfig.host = settings.host;
+                    saveSettings(settings);
+                    liveMode = connectWithRetry(obd, localIp, networkReady, obdConfig, 3, 10);
+                    if (!liveMode) appendAcDiagnostics(obd);
+                }
+            } else {
+                static const unsigned int accents[] = {0xFF5A36, 0x60A5FA, 0x34D399, 0xF472B6};
+                settings.accent = accents[(settings.theme + 1) % 4];
+            }
         }
         if ((keys & KEY_B) && networkReady) {
             liveMode = connectWithRetry(obd, localIp, networkReady, obdConfig, 3, 10);

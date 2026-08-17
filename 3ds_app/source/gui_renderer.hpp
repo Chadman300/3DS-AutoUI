@@ -20,6 +20,8 @@ struct GuiSettings {
     unsigned int gaugeColor[8];
     float x[8];
     float y[8];
+    char host[16];
+    unsigned int port = 35000;
 
     GuiSettings() {
         const float defaultX[8] = {8, 204, 8, 106, 204, 8, 106, 204};
@@ -32,6 +34,8 @@ struct GuiSettings {
             x[index] = defaultX[index];
             y[index] = defaultY[index];
         }
+        const char defaultHost[] = "172.20.10.2";
+        for (unsigned int i = 0; i < sizeof(defaultHost); ++i) host[i] = defaultHost[i];
     }
 };
 
@@ -45,7 +49,8 @@ public:
               const char* connectionError = "", const char* localIp = "");
     void drawSettings(const DashboardData& dashboard, const GuiSettings& settings,
                       size_t selectedGauge, bool liveMode, bool confirmRevert);
-    void drawConnectionError(const char* connectionError, const char* localIp);
+    void drawConnectionError(const char* connectionError, const char* localIp, const char* targetHost,
+                             unsigned int targetPort);
 
 private:
     void text(const char* value, float x, float y, float scale, u32 color, u32 flags = 0);

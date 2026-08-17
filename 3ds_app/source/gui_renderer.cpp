@@ -213,7 +213,7 @@ void GuiRenderer::draw(const DashboardData& dashboard, const std::vector<GaugeSa
     // Bottom screen: show the error takeover while disconnected, otherwise the normal editor.
     const bool hasError = !liveMode && connectionError != nullptr && connectionError[0] != '\0';
     if (hasError) {
-        drawConnectionError(connectionError, localIp);
+        drawConnectionError(connectionError, localIp, settings.host, settings.port);
     } else {
         drawSettings(dashboard, settings, selectedGauge, liveMode, confirmRevert);
     }
@@ -222,7 +222,8 @@ void GuiRenderer::draw(const DashboardData& dashboard, const std::vector<GaugeSa
     C3D_FrameEnd(0);
 }
 
-void GuiRenderer::drawConnectionError(const char* connectionError, const char* localIp) {
+void GuiRenderer::drawConnectionError(const char* connectionError, const char* localIp, const char* targetHost,
+                                      unsigned int targetPort) {
     if (!ready_) return;
 
     C2D_TargetClear(bottom_, color(0x0B0F17));
@@ -251,9 +252,11 @@ void GuiRenderer::drawConnectionError(const char* connectionError, const char* l
         text(ipLine, 14, cursorY, 0.46f, accent);
         cursorY += 30.0f;
     }
-    text("TARGET: 192.168.0.10:35000", 14, cursorY, 0.38f, foreground);
-    cursorY += 34.0f;
-    text("PRESS B TO RETRY", 14, cursorY, 0.46f, accent);
+    char targetLine[48];
+    snprintf(targetLine, sizeof(targetLine), "TARGET: %s:%u", targetHost, targetPort);
+    text(targetLine, 14, cursorY, 0.38f, foreground);
+    cursorY += 30.0f;
+    text("PRESS B TO RETRY  |  Y TO EDIT IP", 14, cursorY, 0.34f, accent);
 }
 
 void GuiRenderer::drawSettings(const DashboardData& dashboard, const GuiSettings& settings,

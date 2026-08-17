@@ -8,7 +8,7 @@
 #include "dashboard.hpp"
 
 struct ObdConnectionConfig {
-    std::string host = "192.168.0.10";
+    std::string host = "172.20.10.2";
     u16 port = 35000;
     int timeout_ms = 800;
 };

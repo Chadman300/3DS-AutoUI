@@ -49,6 +49,36 @@ it joins a different network, so it needs to be discovered.
    certainly the OBD adapter. Cross-check the MAC address prefix for
    extra confidence if multiple unknown entries show up.
 
+## Testing real TCP connectivity (not just ARP visibility)
+
+ARP resolution succeeding does **not** guarantee actual TCP/IP traffic is
+allowed between two hotspot clients — some phones enforce "client
+isolation" that blocks device-to-device data while still allowing ARP.
+To test the real thing, bind explicitly to the hotspot Wi-Fi interface
+(don't rely on `Test-NetConnection` alone if the laptop also has an
+Ethernet connection active — it may silently route through the wrong
+interface):
+
+```powershell
+$client = New-Object System.Net.Sockets.TcpClient
+$local = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse("172.20.10.3"), 0)
+$client.Client.Bind($local)
+try {
+    $client.Connect("172.20.10.2", 35000)
+    "TCP connect SUCCEEDED"
+} catch {
+    "TCP connect FAILED: $($_.Exception.Message)"
+} finally {
+    $client.Close()
+}
+```
+
+Replace `172.20.10.3` with your laptop's own hotspot IP (check with
+`ipconfig`) and `172.20.10.2` with the OBD adapter's discovered IP. If
+this fails while ARP can see the adapter, it strongly suggests hotspot
+client isolation is blocking the connection — a travel router (which
+does not isolate its own clients) is the recommended workaround.
+
 ## After finding the IP
 
 Update `host` in `ObdConnectionConfig` (`3ds_app/source/obd_client.hpp`)
