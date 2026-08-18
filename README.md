@@ -5,6 +5,7 @@ A starter project for a 3DS car dashboard that reads live OBD2 data from a Vgate
 ## Architecture
 
 - `bridge/obd_bridge.py`: local bridge that connects to the OBD2 adapter and polls supported PIDs
+- `esp32_bridge/esp32_bridge.ino`: ESP32 firmware that replaces the middle-device entirely — it joins the iCar Pro's Wi-Fi and hosts its own Wi-Fi for the 3DS, proxying the ELM327 traffic and mirroring it to the serial monitor
 - `config/subaru_wrx_profile.json`: WRX-specific profile with gauge ranges and theme settings
 - `dashboard/demo_dashboard.py`: sample dashboard renderer that prints the normalized gauge data and simulates what the 3DS UI can consume
 

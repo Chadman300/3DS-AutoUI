@@ -8,7 +8,9 @@
 #include "dashboard.hpp"
 
 struct ObdConnectionConfig {
-    std::string host = "172.20.10.2";
+    // Default targets the ESP32 bridge AP (see esp32_bridge/). For the legacy
+    // iPhone-hotspot setup use 172.20.10.2; for the iCar Pro's own AP use 192.168.0.10.
+    std::string host = "192.168.4.1";
     u16 port = 35000;
     int timeout_ms = 4000;
 };

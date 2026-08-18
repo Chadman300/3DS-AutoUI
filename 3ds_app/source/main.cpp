@@ -394,7 +394,7 @@ int main(int argc, char** argv) {
                 snprintf(buffer, sizeof(buffer), "%s", settings.host);
                 SwkbdState swkbd;
                 swkbdInit(&swkbd, SWKBD_TYPE_NORMAL, 2, 15);
-                swkbdSetHintText(&swkbd, "Adapter IP e.g. 172.20.10.2");
+                swkbdSetHintText(&swkbd, "Adapter IP e.g. 192.168.4.1");
                 SwkbdButton button = swkbdInputText(&swkbd, buffer, sizeof(buffer));
                 if (button != SWKBD_BUTTON_NONE && buffer[0] != '\0') {
                     snprintf(settings.host, sizeof(settings.host), "%s", buffer);

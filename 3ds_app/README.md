@@ -29,8 +29,11 @@ The build output is `3ds_app/3ds_autoui.3dsx`. Copy it to the 3DS SD card under
 `/3ds/3ds_autoui/3ds_autoui.3dsx` and launch it from the Homebrew Launcher.
 
 The current hardware build connects directly to an ELM327-compatible Wi-Fi adapter over
-TCP and polls the standard OBD2 PIDs. It defaults to `192.168.0.10:35000`, matching the
-Python bridge. If the adapter cannot be reached, the app remains usable with sample data
+TCP and polls the standard OBD2 PIDs. It defaults to `192.168.4.1:35000`, matching the
+ESP32 bridge in [`../esp32_bridge/`](../esp32_bridge/). If you are connecting straight to
+an iCar Pro or another middle-device, override the host with `Y` on the settings screen
+(common values: `192.168.0.10` for the iCar Pro's own AP, `172.20.10.2` for an iPhone
+hotspot). If the adapter cannot be reached, the app remains usable with sample data
 and reports the connection error on the bottom screen.
 
 The 3DS must already be connected to the scanner's Wi-Fi access point before launching
@@ -62,7 +65,8 @@ background loading can be added after the GUI is validated on hardware.
 ## Hardware test checklist
 
 1. Join the Vgate scanner's Wi-Fi network on the 3DS.
-2. Confirm the adapter IP and port are `192.168.0.10:35000` or update `obd_client.hpp`.
+2. Confirm the adapter IP and port are `192.168.4.1:35000` (ESP32 bridge) or update the
+   host with `Y` on the settings screen.
 3. Confirm the `.3dsx` launches without crashing.
 4. Confirm the bottom screen reports `OBD2: connected`.
 5. Confirm the top-screen values update approximately twice per second with the engine running.

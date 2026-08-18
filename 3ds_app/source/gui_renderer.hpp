@@ -36,7 +36,7 @@ struct GuiSettings {
             x[index] = defaultX[index];
             y[index] = defaultY[index];
         }
-        const char defaultHost[] = "172.20.10.2";
+        const char defaultHost[] = "192.168.4.1";
         for (unsigned int i = 0; i < sizeof(defaultHost); ++i) host[i] = defaultHost[i];
     }
 };
