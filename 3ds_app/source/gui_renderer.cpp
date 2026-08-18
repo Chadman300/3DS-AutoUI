@@ -74,6 +74,12 @@ bool GuiRenderer::init() {
         shutdown();
         return false;
     }
+    // Optional brand logo from RomFS; failure is non-fatal (falls back to text-only header).
+    logoSheet_ = C2D_SpriteSheetLoad("romfs:/gfx/autoui_brand.t3x");
+    if (logoSheet_ != nullptr && C2D_SpriteSheetCount(logoSheet_) > 0) {
+        logoImage_ = C2D_SpriteSheetGetImage(logoSheet_, 0);
+        logoReady_ = true;
+    }
     ready_ = true;
     return true;
 }
@@ -82,6 +88,11 @@ void GuiRenderer::shutdown() {
     if (textBuffer_ != nullptr) {
         C2D_TextBufDelete(textBuffer_);
         textBuffer_ = nullptr;
+    }
+    if (logoSheet_ != nullptr) {
+        C2D_SpriteSheetFree(logoSheet_);
+        logoSheet_ = nullptr;
+        logoReady_ = false;
     }
     if (top_ != nullptr) top_ = nullptr;
     if (ready_) {
@@ -112,6 +123,13 @@ float GuiRenderer::valueFor(const GaugeConfig& gauge, const std::vector<GaugeSam
     return 0.0f;
 }
 
+bool GuiRenderer::sampleValid(const GaugeConfig& gauge, const std::vector<GaugeSample>& samples) const {
+    for (const auto& sample : samples) {
+        if (sample.id == gauge.id) return sample.valid;
+    }
+    return false;
+}
+
 void GuiRenderer::text(const char* value, float x, float y, float scale, u32 textColor, u32 flags) {
     C2D_Text parsed;
     if (C2D_TextParse(&parsed, textBuffer_, value) != nullptr) {
@@ -131,7 +149,8 @@ void GuiRenderer::drawDialLimits(const GaugeConfig& gauge, float centerX, float 
 
 void GuiRenderer::draw(const DashboardData& dashboard, const std::vector<GaugeSample>& samples,
                        const GuiSettings& settings, bool liveMode, size_t selectedGauge,
-                       bool confirmRevert, const char* connectionError, const char* localIp) {
+                       bool confirmRevert, const char* connectionError, const char* localIp,
+                       float errorScroll) {
     if (!ready_) return;
 
     C2D_TextBufClear(textBuffer_);
@@ -148,6 +167,7 @@ void GuiRenderer::draw(const DashboardData& dashboard, const std::vector<GaugeSa
     C2D_DrawRectSolid(8, 8, 0.0f, 6, 38, accent);
     text(dashboard.brand.c_str(), 22, 13, 0.62f, accent);
     text(dashboard.vehicleName.c_str(), 22, 29, 0.42f, foreground);
+    if (logoReady_) C2D_DrawImageAt(logoImage_, 356.0f, 11.0f, 0.5f, nullptr, 1.0f, 1.0f);
     text(liveMode ? "CONNECTED" : "OFFLINE", 320, 18, 0.42f, liveMode ? color(0x34D399) : color(0xFBBF24), C2D_AlignRight);
 
     const GaugeConfig& rpm = dashboard.gauges[0];
@@ -161,16 +181,18 @@ void GuiRenderer::draw(const DashboardData& dashboard, const std::vector<GaugeSa
     char valueText[32];
     const float rpmFraction = std::clamp((rpmValue - rpm.min) / (rpm.max - rpm.min), 0.0f, 1.0f);
     const float speedFraction = std::clamp((speedValue - speed.min) / (speed.max - speed.min), 0.0f, 1.0f);
-    const auto drawPrimaryGauge = [&](size_t index, const GaugeConfig& gauge, float value, float fraction) {
+    const auto drawPrimaryGauge = [&](size_t index, const GaugeConfig& gauge, float value, float fraction, bool valid) {
         if (!settings.visible[index]) return;
+        if (!valid) fraction = 0.0f;
         const float x = settings.x[index];
         const float y = settings.y[index];
         const u32 gaugeColor = statusColor(value, gauge, settings, index);
         if (!settings.dial[index]) {
             C2D_DrawRectSolid(x, y, 0.0f, 188, 78, panel);
             text(gauge.label.c_str(), x + 10, y + 8, 0.42f, foreground);
-            snprintf(valueText, sizeof(valueText), "%.0f", value);
-            text(valueText, x + 10, y + 24, 1.08f, gaugeColor);
+            if (valid) snprintf(valueText, sizeof(valueText), "%.0f", value);
+            else snprintf(valueText, sizeof(valueText), "--");
+            text(valueText, x + 10, y + 24, 1.08f, valid ? gaugeColor : color(0x475569));
             text(gauge.unit.c_str(), x + 124, y + 50, 0.40f, foreground);
             C2D_DrawRectSolid(x + 10, y + 65, 0.0f, 168, 8, color(0x273449));
             C2D_DrawRectSolid(x + 10, y + 65, 0.0f, 168.0f * fraction, 8, gaugeColor);
@@ -181,8 +203,8 @@ void GuiRenderer::draw(const DashboardData& dashboard, const std::vector<GaugeSa
             text(gauge.unit.c_str(), x + 92, y + 82, 0.38f, foreground, C2D_AlignCenter);
         }
     };
-    drawPrimaryGauge(0, rpm, rpmValue, rpmFraction);
-    drawPrimaryGauge(1, speed, speedValue, speedFraction);
+    drawPrimaryGauge(0, rpm, rpmValue, rpmFraction, sampleValid(rpm, samples));
+    drawPrimaryGauge(1, speed, speedValue, speedFraction, sampleValid(speed, samples));
 
     const float cardWidth = 92.0f;
     const float cardHeight = 43.0f;
@@ -192,13 +214,15 @@ void GuiRenderer::draw(const DashboardData& dashboard, const std::vector<GaugeSa
         const float x = settings.x[index];
         const float y = settings.y[index];
         const float value = valueFor(gauge, samples);
+        const bool valid = sampleValid(gauge, samples);
         const u32 gaugeColor = statusColor(value, gauge, settings, index);
-        const float fraction = std::clamp((value - gauge.min) / (gauge.max - gauge.min), 0.0f, 1.0f);
+        const float fraction = valid ? std::clamp((value - gauge.min) / (gauge.max - gauge.min), 0.0f, 1.0f) : 0.0f;
         if (!settings.dial[index]) {
             C2D_DrawRectSolid(x, y, 0.0f, cardWidth, cardHeight, panel);
             text(gauge.label.c_str(), x + 6, y + 4, 0.34f, foreground);
-            snprintf(valueText, sizeof(valueText), "%.1f %s", value, gauge.unit.c_str());
-            text(valueText, x + 6, y + 19, 0.39f, gaugeColor);
+            if (valid) snprintf(valueText, sizeof(valueText), "%.1f %s", value, gauge.unit.c_str());
+            else snprintf(valueText, sizeof(valueText), "-- %s", gauge.unit.c_str());
+            text(valueText, x + 6, y + 19, 0.39f, valid ? gaugeColor : color(0x475569));
             C2D_DrawRectSolid(x + 6, y + 35, 0.0f, 80, 4, color(0x273449));
             C2D_DrawRectSolid(x + 6, y + 35, 0.0f, 80.0f * fraction, 4, gaugeColor);
         } else {
@@ -213,7 +237,7 @@ void GuiRenderer::draw(const DashboardData& dashboard, const std::vector<GaugeSa
     // Bottom screen: show the error takeover while disconnected, otherwise the normal editor.
     const bool hasError = !liveMode && connectionError != nullptr && connectionError[0] != '\0';
     if (hasError) {
-        drawConnectionError(connectionError, localIp, settings.host, settings.port);
+        drawConnectionError(connectionError, localIp, settings.host, settings.port, errorScroll);
     } else {
         drawSettings(dashboard, settings, selectedGauge, liveMode, confirmRevert);
     }
@@ -223,7 +247,7 @@ void GuiRenderer::draw(const DashboardData& dashboard, const std::vector<GaugeSa
 }
 
 void GuiRenderer::drawConnectionError(const char* connectionError, const char* localIp, const char* targetHost,
-                                      unsigned int targetPort) {
+                                      unsigned int targetPort, float scrollOffset) {
     if (!ready_) return;
 
     C2D_TargetClear(bottom_, color(0x0B0F17));
@@ -238,25 +262,37 @@ void GuiRenderer::drawConnectionError(const char* connectionError, const char* l
     text("CONNECTION ERROR", 16, 16, 0.56f, errorRed);
     text("BUILD " __DATE__ " " __TIME__, 306, 4, 0.38f, rgba(0x94A3B8), C2D_AlignRight);
 
+    // Scrollable message area, so long diagnostics never get silently cut off.
     const std::vector<std::string> lines = wrapText(connectionError, 20);
-    float cursorY = 60.0f;
-    for (size_t i = 0; i < lines.size() && i < 5; ++i) {
-        text(lines[i].c_str(), 14, cursorY, 0.52f, foreground);
-        cursorY += 32.0f;
-    }
-    cursorY += 10.0f;
+    const float lineHeight = 32.0f;
+    const float viewTop = 50.0f;
+    const float viewBottom = 170.0f;
+    const float contentHeight = static_cast<float>(lines.size()) * lineHeight;
+    const float maxScroll = std::max(0.0f, contentHeight - (viewBottom - viewTop));
+    const float clampedScroll = std::clamp(scrollOffset, 0.0f, maxScroll);
 
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const float y = viewTop + static_cast<float>(i) * lineHeight - clampedScroll;
+        if (y + lineHeight < viewTop || y > viewBottom) continue;
+        text(lines[i].c_str(), 14, y, 0.52f, foreground);
+    }
+    if (maxScroll > 0.0f) {
+        if (clampedScroll > 0.0f) text("^ MORE ABOVE", 210, viewTop, 0.30f, accent);
+        if (clampedScroll < maxScroll) text("v MORE BELOW", 210, viewBottom - 12, 0.30f, accent);
+    }
+
+    float cursorY = viewBottom + 12.0f;
     if (localIp != nullptr && localIp[0] != '\0') {
         char ipLine[48];
         snprintf(ipLine, sizeof(ipLine), "3DS IP: %s", localIp);
         text(ipLine, 14, cursorY, 0.46f, accent);
-        cursorY += 30.0f;
+        cursorY += 26.0f;
     }
     char targetLine[48];
     snprintf(targetLine, sizeof(targetLine), "TARGET: %s:%u", targetHost, targetPort);
-    text(targetLine, 14, cursorY, 0.38f, foreground);
-    cursorY += 30.0f;
-    text("PRESS B TO RETRY  |  Y TO EDIT IP", 14, cursorY, 0.34f, accent);
+    text(targetLine, 14, cursorY, 0.34f, foreground);
+    cursorY += 22.0f;
+    text("B RETRY | Y EDIT IP | UP/DOWN SCROLL", 14, cursorY, 0.28f, accent);
 }
 
 void GuiRenderer::drawSettings(const DashboardData& dashboard, const GuiSettings& settings,
@@ -309,15 +345,15 @@ void GuiRenderer::drawSettings(const DashboardData& dashboard, const GuiSettings
     text("SELECT GAUGE", 12, 43, 0.34f, foreground);
     for (size_t index = 0; index < dashboard.gauges.size(); ++index) {
         const float x = 10.0f + static_cast<float>(index % 2) * 154.0f;
-        const float y = 58.0f + static_cast<float>(index / 2) * 25.0f;
+        const float y = 56.0f + static_cast<float>(index / 2) * 21.0f;
         const bool active = index == selectedGauge;
-        C2D_DrawRectSolid(x, y, 0.0f, 146, 21, active ? accent : panel);
-        text(dashboard.gauges[index].label.c_str(), x + 6, y + 4, 0.34f, foreground);
-        C2D_DrawRectSolid(x + 91, y + 5, 0.0f, 11, 11, foreground);
-        C2D_DrawRectSolid(x + 93, y + 7, 0.1f, 7, 7, panel);
-        if (settings.dial[index]) C2D_DrawRectSolid(x + 94, y + 8, 0.2f, 5, 5, accent);
-        text("DIAL", x + 105, y + 5, 0.20f, foreground);
-        C2D_DrawRectSolid(x + 130, y + 5, 0.0f, 8, 11, color(settings.gaugeColor[index]));
+        C2D_DrawRectSolid(x, y, 0.0f, 146, 19, active ? accent : panel);
+        text(dashboard.gauges[index].label.c_str(), x + 6, y + 3, 0.32f, foreground);
+        C2D_DrawRectSolid(x + 91, y + 4, 0.0f, 11, 11, foreground);
+        C2D_DrawRectSolid(x + 93, y + 6, 0.1f, 7, 7, panel);
+        if (settings.dial[index]) C2D_DrawRectSolid(x + 94, y + 7, 0.2f, 5, 5, accent);
+        text("DIAL", x + 105, y + 4, 0.20f, foreground);
+        C2D_DrawRectSolid(x + 130, y + 4, 0.0f, 8, 11, color(settings.gaugeColor[index]));
     }
 
     text("RGB COLOR", 12, 165, 0.36f, foreground);

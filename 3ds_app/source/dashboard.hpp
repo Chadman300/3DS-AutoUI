@@ -30,6 +30,7 @@ struct ThemeConfig {
 struct GaugeSample {
     std::string id;
     float value;
+    bool valid = true;
 };
 
 struct DashboardData {
@@ -72,11 +73,13 @@ inline DashboardData makeWrxDashboard() {
         {"rpm", "RPM", "RPM", 0.0f, 8000.0f, 6500.0f, 7200.0f, 0xFF5A36, true},
         {"speed", "Speed", "MPH", 0.0f, 140.0f, 110.0f, 130.0f, 0x60A5FA, true},
         {"coolant_temp", "Coolant", "C", 0.0f, 130.0f, 95.0f, 110.0f, 0xFBBF24, true},
-        {"boost", "Boost", "psi", -5.0f, 25.0f, 18.0f, 22.0f, 0x34D399, true},
+        {"boost", "Boost", "psi", -15.0f, 25.0f, 18.0f, 22.0f, 0x34D399, true},
         {"battery_voltage", "Voltage", "V", 10.0f, 15.0f, 11.5f, 10.5f, 0xA78BFA, true},
         {"throttle_position", "Throttle", "%", 0.0f, 100.0f, 85.0f, 95.0f, 0xF472B6, true},
         {"engine_load", "Load", "%", 0.0f, 100.0f, 80.0f, 95.0f, 0x22D3EE, true},
-        {"fuel_level", "Fuel", "%", 0.0f, 100.0f, 15.0f, 8.0f, 0xFCD34D, true}
+        {"fuel_level", "Fuel", "%", 0.0f, 100.0f, 15.0f, 8.0f, 0xFCD34D, true},
+        {"oil_temp", "Oil Temp", "C", 0.0f, 160.0f, 120.0f, 140.0f, 0xF97316, true},
+        {"oil_pressure", "Oil Pres", "psi", 0.0f, 100.0f, 15.0f, 8.0f, 0x38BDF8, true}
     };
 
     return d;

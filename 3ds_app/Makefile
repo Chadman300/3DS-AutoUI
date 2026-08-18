@@ -6,7 +6,9 @@ SOURCES         := source
 APP_TITLE       := 3DS AutoUI
 APP_DESCRIPTION := Branded Subaru WRX OBD2 dashboard
 APP_AUTHOR      := 3DS AutoUI
-APP_ICON        := $(DEVKITPRO)/libctru/default_icon.png
+APP_ICON        := assets/autoui_icon.png
+ROMFS           := romfs
+LOGO_T3X        := $(ROMFS)/gfx/autoui_brand.t3x
 
 ARCH            := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 CFLAGS          := -g -Wall -O2 -mword-relocations -ffunction-sections $(ARCH)
@@ -44,11 +46,16 @@ $(TARGET).smdh: $(APP_ICON) Makefile
 	@echo "SMDH $@"
 	@smdhtool --create "$(APP_TITLE)" "$(APP_DESCRIPTION)" "$(APP_AUTHOR)" $(APP_ICON) $@
 
-$(TARGET).3dsx: $(TARGET).elf $(TARGET).smdh
+$(LOGO_T3X): assets/autoui_brand.t3s assets/autoui_brand.png
+	@echo "TEX3DS $@"
+	@mkdir -p $(ROMFS)/gfx
+	@cd assets && tex3ds -i autoui_brand.t3s -o ../$(ROMFS)/gfx/autoui_brand.t3x
+
+$(TARGET).3dsx: $(TARGET).elf $(TARGET).smdh $(LOGO_T3X)
 	@echo "3DSX $@"
-	@3dsxtool $< $@ --smdh=$(TARGET).smdh
+	@3dsxtool $< $@ --smdh=$(TARGET).smdh --romfs=$(ROMFS)
 
 clean:
-	@rm -rf $(BUILD) $(TARGET).3dsx $(TARGET).elf $(TARGET).smdh
+	@rm -rf $(BUILD) $(ROMFS) $(TARGET).3dsx $(TARGET).elf $(TARGET).smdh
 
 -include $(OBJECTS:.o=.d)

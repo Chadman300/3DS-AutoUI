@@ -55,14 +55,14 @@ static void renderFallback(PrintConsole* console, const DashboardData& dashboard
     }
 }
 
-static void drawBottomStatus(PrintConsole* console, const ObdConnectionConfig& config,
-                             const ObdClient& obd, bool liveMode, const GuiSettings& settings,
+static void drawBottomStatus(PrintConsole* console, const char* host, unsigned int port,
+                             bool liveMode, const char* error, const GuiSettings& settings,
                              size_t selectedGauge) {
     consoleSelect(console);
     consoleClear();
     printf("3DS AutoUI SETTINGS\n\nOBD2: %s\n", liveMode ? "CONNECTED" : "OFFLINE / SAMPLE");
-    printf("Adapter: %s:%u\n", config.host.c_str(), config.port);
-    if (!liveMode) printf("Reason: %.38s\n", obd.lastError().c_str());
+    printf("Adapter: %s:%u\n", host, port);
+    if (!liveMode) printf("Reason: %.38s\n", error);
         printf("\nSelected gauge: %u\n", static_cast<unsigned int>(selectedGauge + 1));
         printf("A visibility  X background  Y accent\n");
         printf("L/R select  B reconnect  START exit\n");
@@ -101,32 +101,6 @@ static std::string detectLocalIp(bool networkReady, const ObdConnectionConfig& c
     }
 
     return "unknown";
-}
-
-// Re-initializes the SOC service in case the socket context got stuck.
-static bool resetSocService() {
-    if (g_socReady) {
-        socExit();
-        g_socReady = false;
-    }
-    g_socReady = socInit(g_socBuffer, SOC_BUFFER_SIZE) == 0;
-    return g_socReady;
-}
-
-// Right after socInit() the Wi-Fi stack may not have a route table populated yet,
-// causing transient socket()/connect() failures. Retry briefly before giving up.
-static bool connectWithRetry(ObdClient& obd, std::string& localIp, bool networkReady,
-                             const ObdConnectionConfig& config, int maxAttempts, int delayFrames) {
-    for (int attempt = 0; attempt < maxAttempts; ++attempt) {
-        if (!networkReady) break;
-        localIp = detectLocalIp(networkReady, config);
-        if (obd.connectToAdapter()) return true;
-        // If the socket layer itself is failing (not just connect), try resetting SOC once.
-        if (attempt == maxAttempts / 2) networkReady = resetSocService();
-        for (int frame = 0; frame < delayFrames; ++frame) gspWaitForVBlank();
-    }
-    localIp = detectLocalIp(networkReady, config);
-    return false;
 }
 
 static bool handleTouch(touchPosition& touch, DashboardData& dashboard, GuiSettings& settings,
@@ -198,24 +172,98 @@ static bool handleTouch(touchPosition& touch, DashboardData& dashboard, GuiSetti
     return false;
 }
 
-// Appends the AC service's current status/error codes to the OBD error so the panel
-// shows fresh diagnostics on every attempt, not just the very first one.
-static void appendAcDiagnostics(ObdClient& obd) {
-    u32 acStatus = 0;
-    u32 acError = 0;
-    u32 acDetail = 0;
+// Writes the AC service status/error codes after a base message, for on-screen diagnostics.
+static void buildAcDiag(const char* base, char* out, size_t outSize) {
+    u32 acStatus = 0, acError = 0, acDetail = 0;
     ACU_GetStatus(&acStatus);
     ACU_GetLastErrorCode(&acError);
     ACU_GetLastDetailErrorCode(&acDetail);
-    char withStatus[256];
-    snprintf(withStatus, sizeof(withStatus), "%s [AC:%lu ERR:%lu DTL:%lu]", obd.lastError().c_str(),
+    snprintf(out, outSize, "%s [AC:%lu ERR:%lu DTL:%lu]", base,
              static_cast<unsigned long>(acStatus), static_cast<unsigned long>(acError),
              static_cast<unsigned long>(acDetail));
-    obd.setError(withStatus);
+}
+
+// Shared state between the render (main) thread and the background network thread. All
+// socket I/O runs on the network thread so the UI never blocks on a slow adapter/Wi-Fi.
+struct NetThread {
+    LightLock lock;
+    ObdClient* obd = nullptr;
+    ObdConnectionConfig config;
+    bool networkReady = false;
+    std::vector<GaugeSample> samples;
+    char localIp[24] = "unknown";
+    char error[256] = "";
+    volatile bool running = true;
+    volatile bool live = false;
+    volatile bool reconnectRequested = false;
+};
+
+// Runs on the network thread only. Connects (with a couple of quick retries) and publishes
+// the result to shared state. Uses svcSleepThread for delays (never graphics calls).
+static void netConnect(NetThread* nt) {
+    if (!nt->networkReady) return;
+    ObdConnectionConfig cfg;
+    LightLock_Lock(&nt->lock);
+    cfg = nt->config;
+    LightLock_Unlock(&nt->lock);
+    nt->obd->setConfig(cfg);
+
+    bool live = false;
+    for (int attempt = 0; attempt < 2 && !live; ++attempt) {
+        live = nt->obd->connectToAdapter();
+        if (!live) svcSleepThread(300 * 1000000LL);
+    }
+    std::string ip = detectLocalIp(true, cfg);
+
+    LightLock_Lock(&nt->lock);
+    nt->live = live;
+    snprintf(nt->localIp, sizeof(nt->localIp), "%s", ip.c_str());
+    if (live) {
+        for (auto& sample : nt->samples) sample.valid = false;
+        nt->error[0] = '\0';
+    } else {
+        buildAcDiag(nt->obd->lastError().c_str(), nt->error, sizeof(nt->error));
+    }
+    LightLock_Unlock(&nt->lock);
+}
+
+static void netThreadMain(void* arg) {
+    NetThread* nt = static_cast<NetThread*>(arg);
+    netConnect(nt);
+    while (nt->running) {
+        if (nt->reconnectRequested) {
+            nt->reconnectRequested = false;
+            netConnect(nt);
+            continue;
+        }
+        if (nt->live) {
+            std::vector<GaugeSample> local;
+            LightLock_Lock(&nt->lock);
+            local = nt->samples;
+            LightLock_Unlock(&nt->lock);
+
+            bool lost = false;
+            const bool ok = nt->obd->pollStep(local, lost);
+
+            LightLock_Lock(&nt->lock);
+            nt->samples = local;
+            if (!ok && lost) {
+                nt->live = false;
+                buildAcDiag(nt->obd->lastError().c_str(), nt->error, sizeof(nt->error));
+            }
+            LightLock_Unlock(&nt->lock);
+            if (!ok && lost) nt->obd->disconnect();
+            svcSleepThread(15 * 1000000LL); // brief gap between PIDs
+        } else {
+            svcSleepThread(120 * 1000000LL); // idle while disconnected
+        }
+    }
+    nt->obd->disconnect();
 }
 
 int main(int argc, char** argv) {
     gfxInitDefault();
+    romfsInit();
     DashboardData dashboard = makeWrxDashboard();
     GuiSettings settings;
     loadSettings(settings);
@@ -272,34 +320,55 @@ int main(int argc, char** argv) {
         {"battery_voltage", 13.9f},
         {"throttle_position", 38.0f},
         {"engine_load", 46.0f},
-        {"fuel_level", 71.0f}
+        {"fuel_level", 71.0f},
+        {"oil_temp", 96.0f},
+        {"oil_pressure", 45.0f}
     };
 
     ObdConnectionConfig obdConfig;
     obdConfig.host = settings.host;
     obdConfig.port = static_cast<u16>(settings.port);
     ObdClient obd(obdConfig);
-    std::string localIp = "unknown";
-    // Give the Wi-Fi stack a moment to settle before giving up on the first attempt.
-    bool liveMode = networkReady && connectWithRetry(obd, localIp, networkReady, obdConfig, 5, 20);
+
+    // All socket I/O runs on a background thread so the render loop never blocks on the adapter.
+    NetThread net;
+    LightLock_Init(&net.lock);
+    net.obd = &obd;
+    net.config = obdConfig;
+    net.networkReady = networkReady;
+    net.samples = samples;
     if (!networkReady) {
-        obd.setError("Wi-Fi not connected - check 3DS Internet Settings");
-    } else if (!liveMode) {
-        appendAcDiagnostics(obd);
+        snprintf(net.error, sizeof(net.error), "Wi-Fi not connected - check 3DS Internet Settings");
     }
+    s32 mainPrio = 0x30;
+    svcGetThreadPriority(&mainPrio, CUR_THREAD_HANDLE);
+    Thread netThread = threadCreate(netThreadMain, &net, 32 * 1024, mainPrio + 1, -2, false);
 
     size_t selectedGauge = settings.selected % dashboard.gauges.size();
     bool confirmRevert = false;
     int draggingGauge = -1;
-    if (!guiMode) renderFallback(bottomConsole, dashboard, samples, "citro2d initialization failed");
-    if (!guiMode) drawBottomStatus(bottomConsole, obdConfig, obd, liveMode, settings, selectedGauge);
+    float errorScroll = 0.0f;
 
-    u64 lastPoll = 0;
     while (aptMainLoop()) {
         hidScanInput();
         u32 keys = hidKeysDown();
         touchPosition touch;
         if (keys & KEY_START) break;
+
+        // Snapshot the background thread's state once per frame (cheap copy under the lock).
+        bool liveMode;
+        std::vector<GaugeSample> frameSamples;
+        char frameIp[24];
+        char frameError[256];
+        LightLock_Lock(&net.lock);
+        liveMode = net.live;
+        frameSamples = net.samples;
+        snprintf(frameIp, sizeof(frameIp), "%s", net.localIp);
+        snprintf(frameError, sizeof(frameError), "%s", net.error);
+        LightLock_Unlock(&net.lock);
+
+        // Capture revert state at frame start so B can't both cancel a revert and reconnect.
+        const bool revertActive = confirmRevert;
         if (confirmRevert && (keys & KEY_A)) {
             GuiSettings defaults;
             settings = defaults;
@@ -311,6 +380,8 @@ int main(int argc, char** argv) {
         }
         if (keys & KEY_LEFT) selectedGauge = (selectedGauge + dashboard.gauges.size() - 1) % dashboard.gauges.size();
         if (keys & KEY_RIGHT) selectedGauge = (selectedGauge + 1) % dashboard.gauges.size();
+        if (!liveMode && (keys & (KEY_UP | KEY_CPAD_UP))) errorScroll = std::max(0.0f, errorScroll - 32.0f);
+        if (!liveMode && (keys & (KEY_DOWN | KEY_CPAD_DOWN))) errorScroll += 32.0f;
         if (!confirmRevert && (keys & KEY_A)) settings.visible[selectedGauge] = !settings.visible[selectedGauge];
         if (keys & KEY_X) {
             static const unsigned int backgrounds[] = {0x0B1220, 0x101010, 0x18212B, 0x22141A};
@@ -327,19 +398,25 @@ int main(int argc, char** argv) {
                 SwkbdButton button = swkbdInputText(&swkbd, buffer, sizeof(buffer));
                 if (button != SWKBD_BUTTON_NONE && buffer[0] != '\0') {
                     snprintf(settings.host, sizeof(settings.host), "%s", buffer);
-                    obdConfig.host = settings.host;
                     saveSettings(settings);
-                    liveMode = connectWithRetry(obd, localIp, networkReady, obdConfig, 3, 10);
-                    if (!liveMode) appendAcDiagnostics(obd);
+                    errorScroll = 0.0f;
+                    // Hand the new host to the network thread and ask it to reconnect.
+                    LightLock_Lock(&net.lock);
+                    net.config.host = settings.host;
+                    LightLock_Unlock(&net.lock);
+                    net.reconnectRequested = true;
                 }
             } else {
                 static const unsigned int accents[] = {0xFF5A36, 0x60A5FA, 0x34D399, 0xF472B6};
                 settings.accent = accents[(settings.theme + 1) % 4];
             }
         }
-        if ((keys & KEY_B) && networkReady) {
-            liveMode = connectWithRetry(obd, localIp, networkReady, obdConfig, 3, 10);
-            if (!liveMode) appendAcDiagnostics(obd);
+        if ((keys & KEY_B) && networkReady && !liveMode && !revertActive) {
+            errorScroll = 0.0f;
+            LightLock_Lock(&net.lock);
+            net.config.host = settings.host;
+            LightLock_Unlock(&net.lock);
+            net.reconnectRequested = true;
         }
         if ((keys & KEY_TOUCH || hidKeysHeld() & KEY_TOUCH) && handleTouch(touch, dashboard, settings, selectedGauge, confirmRevert, draggingGauge)) {
             settings.selected = static_cast<unsigned int>(selectedGauge);
@@ -351,21 +428,19 @@ int main(int argc, char** argv) {
             saveSettings(settings);
         }
 
-        u64 now = osGetTime();
-        if (liveMode && now - lastPoll >= 500) {
-            if (!obd.poll(samples)) {
-                liveMode = false;
-                obd.disconnect();
-            }
-            lastPoll = now;
-        }
         if (guiMode) {
-            gui.draw(dashboard, samples, settings, liveMode, selectedGauge, confirmRevert, obd.lastError().c_str(), localIp.c_str());
+            gui.draw(dashboard, frameSamples, settings, liveMode, selectedGauge, confirmRevert, frameError, frameIp, errorScroll);
         }
-        else renderFallback(bottomConsole, dashboard, samples, "citro2d initialization failed");
+        else {
+            renderFallback(bottomConsole, dashboard, frameSamples, "citro2d initialization failed");
+            drawBottomStatus(bottomConsole, settings.host, settings.port, liveMode, frameError, settings, selectedGauge);
+        }
         gspWaitForVBlank();
     }
 
+    net.running = false;
+    threadJoin(netThread, U64_MAX);
+    threadFree(netThread);
     obd.disconnect();
     settings.selected = static_cast<unsigned int>(selectedGauge);
     saveSettings(settings);

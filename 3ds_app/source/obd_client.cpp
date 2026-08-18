@@ -52,11 +52,43 @@ void assignSample(std::vector<GaugeSample>& samples, const char* id, float value
     for (auto& sample : samples) {
         if (sample.id == id) {
             sample.value = value;
+            sample.valid = true;
             return;
         }
     }
-    samples.push_back({id, value});
+    samples.push_back({id, value, true});
 }
+
+void markInvalid(std::vector<GaugeSample>& samples, const char* id) {
+    for (auto& sample : samples) {
+        if (sample.id == id) {
+            sample.valid = false;
+            return;
+        }
+    }
+}
+
+// One PID per round-robin step. scale/offset convert the raw byte/word to display units.
+struct PidSpec {
+    const char* pid;
+    const char* id;
+    bool word;
+    float scale;
+    float offset;
+};
+
+const PidSpec kPollPids[] = {
+    {"0C", "rpm", true, 0.25f, 0.0f},
+    {"0D", "speed", false, 1.0f, 0.0f},
+    {"05", "coolant_temp", false, 1.0f, -40.0f},
+    {"0F", "intake_temp", false, 1.0f, -40.0f},
+    {"0B", "boost", false, 1.0f / 6.89476f, -101.3f / 6.89476f},
+    {"11", "throttle_position", false, 100.0f / 255.0f, 0.0f},
+    {"04", "engine_load", false, 100.0f / 255.0f, 0.0f},
+    {"2F", "fuel_level", false, 100.0f / 255.0f, 0.0f},
+    {"42", "battery_voltage", true, 0.001f, 0.0f},
+    {"5C", "oil_temp", false, 1.0f, -40.0f},
+};
 
 std::string formatSocketError(const char* prefix, int err) {
     char text[160];
@@ -99,6 +131,9 @@ void ObdClient::disconnect() {
 bool ObdClient::connectToAdapter() {
     disconnect();
     error_.clear();
+    pollIndex_ = 0;
+    consecutiveFail_ = 0;
+    commLost_ = false;
 
     // 3DS's SOC service does not auto-substitute a default protocol for SOCK_STREAM
     // like desktop kernels do; IPPROTO_IP (0) gets rejected, so pass TCP explicitly.
@@ -125,46 +160,12 @@ bool ObdClient::connectToAdapter() {
         return false;
     }
 
-    int socketFlags = fcntl(socket_, F_GETFL, 0);
-    if (socketFlags < 0 || fcntl(socket_, F_SETFL, socketFlags | O_NONBLOCK) < 0) {
-        setError(formatSocketError("could not configure socket", errno));
-        disconnect();
-        return false;
-    }
-
+    // Blocking connect: the non-blocking + select() completion path is unreliable on the
+    // 3DS SOC service and returned spurious in-progress errno values (-26). The adapter is
+    // on the same subnet, so a blocking connect completes quickly on success.
     int connectResult = connect(socket_, reinterpret_cast<sockaddr*>(&address), sizeof(address));
-    if (connectResult < 0 && errno == EINPROGRESS) {
-        fd_set writeSet;
-        FD_ZERO(&writeSet);
-        FD_SET(socket_, &writeSet);
-        timeval timeout{};
-        timeout.tv_sec = config_.timeout_ms / 1000;
-        timeout.tv_usec = (config_.timeout_ms % 1000) * 1000;
-        connectResult = select(socket_ + 1, nullptr, &writeSet, nullptr, &timeout);
-        if (connectResult > 0) {
-            int socketError = 0;
-            socklen_t socketErrorSize = sizeof(socketError);
-            if (getsockopt(socket_, SOL_SOCKET, SO_ERROR, &socketError, &socketErrorSize) < 0) {
-                connectResult = -1;
-            } else if (socketError != 0) {
-                errno = socketError;
-                connectResult = -1;
-            } else {
-                connectResult = 0;
-            }
-        } else if (connectResult == 0) {
-            errno = ETIMEDOUT;
-            connectResult = -1;
-        }
-    }
-
     if (connectResult < 0) {
         setError(formatSocketError("connect failed", errno));
-        disconnect();
-        return false;
-    }
-    if (connectResult == 0 && fcntl(socket_, F_SETFL, socketFlags) < 0) {
-        setError(formatSocketError("could not restore socket mode", errno));
         disconnect();
         return false;
     }
@@ -193,6 +194,7 @@ bool ObdClient::sendCommand(const char* command, std::string& response) {
     ssize_t sent = send(socket_, request.c_str(), request.size(), 0);
     if (sent != static_cast<ssize_t>(request.size())) {
         setError(formatSocketError("send failed", errno));
+        commLost_ = true;
         return false;
     }
 
@@ -211,6 +213,7 @@ bool ObdClient::sendCommand(const char* command, std::string& response) {
         }
         if (ready < 0) {
             setError(formatSocketError("select failed", errno));
+            commLost_ = true;
             return false;
         }
 
@@ -218,6 +221,7 @@ bool ObdClient::sendCommand(const char* command, std::string& response) {
         if (received <= 0) {
             if (received == 0) setError("adapter closed connection");
             else setError(formatSocketError("receive failed", errno));
+            commLost_ = true;
             return false;
         }
 
@@ -282,7 +286,9 @@ bool ObdClient::poll(std::vector<GaugeSample>& samples) {
 
     int mapKpa = 0;
     if (queryPid("0B", response) && parseByte(response, "0B", 0, mapKpa)) {
-        assignSample(samples, "boost", std::max(0.0f, (mapKpa - 101.3f) / 6.89476f));
+        // Gauge (relative) boost in psi: below 0 = vacuum, above 0 = boost. No clamp, so the
+        // gauge visibly tracks vacuum at idle and positive boost under load.
+        assignSample(samples, "boost", (mapKpa - 101.3f) / 6.89476f);
         anyValue = true;
     }
     if (queryPid("11", response) && parseByte(response, "11", 0, value)) {
@@ -301,7 +307,58 @@ bool ObdClient::poll(std::vector<GaugeSample>& samples) {
         assignSample(samples, "battery_voltage", value / 1000.0f);
         anyValue = true;
     }
+    // Engine oil temperature (SAE standard PID 0x5C): A - 40 degrees C.
+    if (queryPid("5C", response) && parseByte(response, "5C", 0, value)) {
+        assignSample(samples, "oil_temp", static_cast<float>(value - 40));
+        anyValue = true;
+    }
+    // Note: oil PRESSURE has no SAE-standard OBD2 PID, so it cannot be read from a stock
+    // ELM327. The oil_pressure gauge stays at its placeholder value unless a
+    // manufacturer-specific PID is added later.
 
     if (!anyValue && error_.empty()) setError("no supported OBD values");
     return anyValue;
+}
+
+bool ObdClient::pollStep(std::vector<GaugeSample>& samples, bool& connectionLost) {
+    connectionLost = false;
+    if (!isConnected()) {
+        connectionLost = true;
+        return false;
+    }
+
+    const size_t pidCount = sizeof(kPollPids) / sizeof(kPollPids[0]);
+    const PidSpec& spec = kPollPids[pollIndex_];
+    pollIndex_ = (pollIndex_ + 1) % pidCount;
+
+    commLost_ = false;
+    std::string response;
+    bool gotValue = false;
+    if (queryPid(spec.pid, response)) {
+        int raw = 0;
+        const bool parsed = spec.word ? parseWord(response, spec.pid, 0, raw)
+                                      : parseByte(response, spec.pid, 0, raw);
+        if (parsed) {
+            assignSample(samples, spec.id, static_cast<float>(raw) * spec.scale + spec.offset);
+            gotValue = true;
+        }
+    }
+
+    if (commLost_) {
+        connectionLost = true;
+        return false;
+    }
+    if (gotValue) {
+        consecutiveFail_ = 0;
+    } else {
+        // Unsupported PID (NODATA) or parse miss: hide the gauge rather than show a stale value.
+        markInvalid(samples, spec.id);
+        if (++consecutiveFail_ >= static_cast<int>(pidCount)) {
+            // A full cycle with nothing readable means the adapter/link is effectively gone.
+            connectionLost = true;
+            consecutiveFail_ = 0;
+            return false;
+        }
+    }
+    return true;
 }
