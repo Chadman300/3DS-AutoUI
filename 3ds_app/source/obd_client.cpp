@@ -77,13 +77,17 @@ struct PidSpec {
     float offset;
 };
 
-const PidSpec kPollPids[] = {
+const PidSpec kFastPollPids[] = {
     {"0C", "rpm", true, 0.25f, 0.0f},
     {"0D", "speed", false, 1.0f, 0.0f},
+    {"0B", "boost", false, 1.0f / 6.89476f, 0.0f},
+    {"11", "throttle_position", false, 100.0f / 255.0f, 0.0f},
+};
+
+const PidSpec kSlowPollPids[] = {
     {"05", "coolant_temp", false, 1.0f, -40.0f},
     {"0F", "intake_temp", false, 1.0f, -40.0f},
-    {"0B", "boost", false, 1.0f / 6.89476f, -101.3f / 6.89476f},
-    {"11", "throttle_position", false, 100.0f / 255.0f, 0.0f},
+    {"33", "__baro", false, 1.0f, 0.0f},
     {"04", "engine_load", false, 100.0f / 255.0f, 0.0f},
     {"2F", "fuel_level", false, 100.0f / 255.0f, 0.0f},
     {"42", "battery_voltage", true, 0.001f, 0.0f},
@@ -327,9 +331,17 @@ bool ObdClient::pollStep(std::vector<GaugeSample>& samples, bool& connectionLost
         return false;
     }
 
-    const size_t pidCount = sizeof(kPollPids) / sizeof(kPollPids[0]);
-    const PidSpec& spec = kPollPids[pollIndex_];
-    pollIndex_ = (pollIndex_ + 1) % pidCount;
+    const size_t fastPidCount = sizeof(kFastPollPids) / sizeof(kFastPollPids[0]);
+    const size_t slowPidCount = sizeof(kSlowPollPids) / sizeof(kSlowPollPids[0]);
+    constexpr unsigned int slowPollInterval = 8;
+    const bool pollSlow = (++pollStepCount_ % slowPollInterval) == 0;
+    const PidSpec& spec = pollSlow ? kSlowPollPids[slowPollIndex_]
+                                   : kFastPollPids[pollIndex_];
+    if (pollSlow) {
+        slowPollIndex_ = (slowPollIndex_ + 1) % slowPidCount;
+    } else {
+        pollIndex_ = (pollIndex_ + 1) % fastPidCount;
+    }
 
     commLost_ = false;
     std::string response;
@@ -339,7 +351,15 @@ bool ObdClient::pollStep(std::vector<GaugeSample>& samples, bool& connectionLost
         const bool parsed = spec.word ? parseWord(response, spec.pid, 0, raw)
                                       : parseByte(response, spec.pid, 0, raw);
         if (parsed) {
-            assignSample(samples, spec.id, static_cast<float>(raw) * spec.scale + spec.offset);
+            if (strcmp(spec.id, "__baro") == 0) {
+                // Barometric pressure: the live zero reference for boost, not a gauge itself.
+                baroKpa_ = static_cast<float>(raw);
+            } else if (strcmp(spec.id, "boost") == 0) {
+                // Gauge boost = (manifold absolute - barometric) in psi.
+                assignSample(samples, "boost", (static_cast<float>(raw) - baroKpa_) / 6.89476f);
+            } else {
+                assignSample(samples, spec.id, static_cast<float>(raw) * spec.scale + spec.offset);
+            }
             gotValue = true;
         }
     }
@@ -353,12 +373,46 @@ bool ObdClient::pollStep(std::vector<GaugeSample>& samples, bool& connectionLost
     } else {
         // Unsupported PID (NODATA) or parse miss: hide the gauge rather than show a stale value.
         markInvalid(samples, spec.id);
-        if (++consecutiveFail_ >= static_cast<int>(pidCount)) {
+        if (++consecutiveFail_ >= static_cast<int>(fastPidCount + slowPidCount)) {
             // A full cycle with nothing readable means the adapter/link is effectively gone.
             connectionLost = true;
             consecutiveFail_ = 0;
             return false;
         }
     }
+    return true;
+}
+
+bool ObdClient::queryVin(std::string& vin) {
+    if (!isConnected()) return false;
+    std::string response;
+    commLost_ = false;
+    if (!sendCommand("0902", response)) return false;
+
+    // sendCommand already stripped CR/LF/spaces/'>'. A multi-frame VIN reply may still carry
+    // ISO-TP frame indices like "0:" "1:" "2:"; strip those, then keep only hex digits.
+    std::string hex;
+    for (size_t i = 0; i < response.size(); ++i) {
+        const char c = response[i];
+        if (c == ':') continue;
+        // A hex digit immediately followed by ':' is a frame index, not data.
+        if (i + 1 < response.size() && response[i + 1] == ':' && isHex(c)) continue;
+        if (isHex(c)) hex.push_back(c);
+    }
+
+    // The Mode 09 PID 02 payload begins with "490201" followed by the 17 ASCII VIN bytes.
+    const size_t marker = hex.find("490201");
+    if (marker == std::string::npos) return false;
+    const char* p = hex.c_str() + marker + 6;
+
+    std::string result;
+    for (int i = 0; i < 17; ++i) {
+        if (!isHex(p[0]) || !isHex(p[1])) break;
+        const char ch = static_cast<char>((hexValue(p[0]) << 4) | hexValue(p[1]));
+        if (ch >= 32 && ch < 127) result.push_back(ch);
+        p += 2;
+    }
+    if (result.size() < 11) return false; // not a plausible VIN
+    vin = result;
     return true;
 }

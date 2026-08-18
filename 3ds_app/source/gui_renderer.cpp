@@ -106,6 +106,52 @@ bool GuiRenderer::ready() const {
     return ready_;
 }
 
+void GuiRenderer::drawLoading(unsigned int frame) {
+    if (!ready_) return;
+
+    C2D_TextBufClear(textBuffer_);
+    C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+
+    const u32 background = color(0x0B1220);
+    const u32 panel = color(0x111827);
+    const u32 accent = color(0x0F766E);
+    const u32 foreground = color(0xE5E7EB);
+    const u32 muted = color(0x94A3B8);
+
+    C2D_TargetClear(top_, background);
+    C2D_SceneBegin(top_);
+    C2D_DrawRectSolid(0, 0, 0.0f, 400, 240, background);
+    C2D_DrawRectSolid(24, 42, 0.0f, 352, 156, panel);
+    C2D_DrawRectSolid(24, 42, 0.0f, 8, 156, accent);
+    if (logoReady_) C2D_DrawImageAt(logoImage_, 52.0f, 56.0f, 0.5f, nullptr, 1.18f, 1.18f);
+    text("3DS AutoUI", 52, 108, 0.78f, accent);
+    text("3DS AutoUI", 52.8f, 108, 0.78f, accent);
+    text("STARTING DASHBOARD", 52, 143, 0.58f, foreground);
+    text("STARTING DASHBOARD", 52.6f, 143, 0.58f, foreground);
+    text("CONNECTING TO OBD ADAPTER", 52, 174, 0.38f, muted);
+    const char* dots[] = {".", "..", "..."};
+    text(dots[(frame / 12) % 3], 292, 168, 0.76f, accent);
+
+    C2D_TargetClear(bottom_, color(0x0B0F17));
+    C2D_SceneBegin(bottom_);
+    C2D_DrawRectSolid(0, 0, 0.0f, 320, 240, color(0x0B0F17));
+    if (logoReady_) C2D_DrawImageAt(logoImage_, 131.0f, 14.0f, 0.5f, nullptr, 1.80f, 1.80f);
+    text("3DS AutoUI", 160, 88, 0.82f, accent, C2D_AlignCenter);
+    text("3DS AutoUI", 160.8f, 88, 0.82f, accent, C2D_AlignCenter);
+    text("Loading", 160, 130, 0.68f, foreground, C2D_AlignCenter);
+    text("Loading", 160.8f, 130, 0.68f, foreground, C2D_AlignCenter);
+    text("Please wait", 160, 171, 0.44f, muted, C2D_AlignCenter);
+    const unsigned int progress = std::min(frame / 5, 92u);
+    char progressText[24];
+    snprintf(progressText, sizeof(progressText), "CONNECTING  %u%%", progress);
+    text(progressText, 160, 194, 0.30f, muted, C2D_AlignCenter);
+    C2D_DrawRectSolid(40, 214, 0.0f, 240, 10, color(0x273449));
+    C2D_DrawRectSolid(40, 214, 0.0f, 240.0f * static_cast<float>(progress) / 100.0f, 10, accent);
+
+    C2D_Flush();
+    C3D_FrameEnd(0);
+}
+
 u32 GuiRenderer::color(unsigned int rgb) const {
     return rgba(rgb);
 }
@@ -149,8 +195,8 @@ void GuiRenderer::drawDialLimits(const GaugeConfig& gauge, float centerX, float 
 
 void GuiRenderer::draw(const DashboardData& dashboard, const std::vector<GaugeSample>& samples,
                        const GuiSettings& settings, bool liveMode, size_t selectedGauge,
-                       bool confirmRevert, const char* connectionError, const char* localIp,
-                       float errorScroll) {
+                       bool confirmRevert, bool showConnectionError, const char* connectionError,
+                       const char* localIp, float errorScroll) {
     if (!ready_) return;
 
     C2D_TextBufClear(textBuffer_);
@@ -163,79 +209,100 @@ void GuiRenderer::draw(const DashboardData& dashboard, const std::vector<GaugeSa
     const u32 accent = color(settings.accent);
 
     C2D_DrawRectSolid(0, 0, 0.0f, 400, 240, color(settings.background));
-    C2D_DrawRectSolid(8, 8, 0.0f, 384, 38, panel);
-    C2D_DrawRectSolid(8, 8, 0.0f, 6, 38, accent);
-    text(dashboard.brand.c_str(), 22, 13, 0.62f, accent);
-    text(dashboard.vehicleName.c_str(), 22, 29, 0.42f, foreground);
-    if (logoReady_) C2D_DrawImageAt(logoImage_, 356.0f, 11.0f, 0.5f, nullptr, 1.0f, 1.0f);
-    text(liveMode ? "CONNECTED" : "OFFLINE", 320, 18, 0.42f, liveMode ? color(0x34D399) : color(0xFBBF24), C2D_AlignRight);
-
-    const GaugeConfig& rpm = dashboard.gauges[0];
-    const GaugeConfig& speed = dashboard.gauges[1];
-    const float rpmValue = valueFor(rpm, samples);
-    const float speedValue = valueFor(speed, samples);
-    
-        if (settings.selected == 0 && settings.visible[0]) drawSelectionBorder(settings.x[0], settings.y[0], 188, 78);
-        if (settings.selected == 1 && settings.visible[1]) drawSelectionBorder(settings.x[1], settings.y[1], 188, 78);
+    if (settings.bannerVisible) {
+        const float bw = 384.0f * settings.bannerScale;
+        const float bh = 38.0f * settings.bannerScale;
+        const float bx = settings.bannerX - bw * 0.5f;
+        const float by = settings.bannerY - bh * 0.5f;
+        C2D_DrawRectSolid(bx, by, 0.0f, bw, bh, panel);
+        C2D_DrawRectSolid(bx, by, 0.0f, 6, bh, accent);
+        text(dashboard.brand.c_str(), bx + 14, by + 5, 0.62f * settings.bannerScale, accent);
+        text(dashboard.vehicleName.c_str(), bx + 14, by + 21, 0.42f * settings.bannerScale, foreground);
+        if (logoReady_) C2D_DrawImageAt(logoImage_, bx + bw - 28, by + 3, 0.5f, nullptr, settings.bannerScale, settings.bannerScale);
+        text(liveMode ? "CONNECTED" : "OFFLINE", bx + bw - 64, by + 10, 0.42f * settings.bannerScale, liveMode ? color(0x34D399) : color(0xFBBF24), C2D_AlignRight);
+    }
 
     char valueText[32];
-    const float rpmFraction = std::clamp((rpmValue - rpm.min) / (rpm.max - rpm.min), 0.0f, 1.0f);
-    const float speedFraction = std::clamp((speedValue - speed.min) / (speed.max - speed.min), 0.0f, 1.0f);
     const auto drawPrimaryGauge = [&](size_t index, const GaugeConfig& gauge, float value, float fraction, bool valid) {
         if (!settings.visible[index]) return;
         if (!valid) fraction = 0.0f;
-        const float x = settings.x[index];
-        const float y = settings.y[index];
+        const float s = settings.scale[index];
+        const float w = 188.0f * s;
+        const float h = 78.0f * s;
+        const float x = settings.x[index] - w * 0.5f;
+        const float y = settings.y[index] - h * 0.5f;
         const u32 gaugeColor = statusColor(value, gauge, settings, index);
         if (!settings.dial[index]) {
-            C2D_DrawRectSolid(x, y, 0.0f, 188, 78, panel);
-            text(gauge.label.c_str(), x + 10, y + 8, 0.42f, foreground);
+            C2D_DrawRectSolid(x, y, 0.0f, w, h, panel);
+            text(gauge.label.c_str(), x + 10 * s, y + 8 * s, 0.42f * s, foreground);
             if (valid) snprintf(valueText, sizeof(valueText), "%.0f", value);
             else snprintf(valueText, sizeof(valueText), "--");
-            text(valueText, x + 10, y + 24, 1.08f, valid ? gaugeColor : color(0x475569));
-            text(gauge.unit.c_str(), x + 124, y + 50, 0.40f, foreground);
-            C2D_DrawRectSolid(x + 10, y + 65, 0.0f, 168, 8, color(0x273449));
-            C2D_DrawRectSolid(x + 10, y + 65, 0.0f, 168.0f * fraction, 8, gaugeColor);
+            text(valueText, x + 10 * s, y + 24 * s, 1.08f * s, valid ? gaugeColor : color(0x475569));
+            text(gauge.unit.c_str(), x + 124 * s, y + 50 * s, 0.40f * s, foreground);
+            C2D_DrawRectSolid(x + 10 * s, y + 65 * s, 0.0f, 168.0f * s, 8 * s, color(0x273449));
+            C2D_DrawRectSolid(x + 10 * s, y + 65 * s, 0.0f, 168.0f * s * fraction, 8 * s, gaugeColor);
         } else {
-            drawDial(x + 92, y + 39, 37, fraction, gaugeColor, foreground, panel);
-            text(gauge.label.c_str(), x + 92, y + 1, 0.38f, foreground, C2D_AlignCenter);
-            drawDialLimits(gauge, x + 92, y + 39, 37, 0.25f, foreground);
-            text(gauge.unit.c_str(), x + 92, y + 82, 0.38f, foreground, C2D_AlignCenter);
+            drawDial(x + 92 * s, y + 39 * s, 37 * s, fraction, gaugeColor, foreground, panel);
+            text(gauge.label.c_str(), x + 92 * s, y + 1 * s, 0.38f * s, foreground, C2D_AlignCenter);
+            if (!valid) text("--", x + 92 * s, y + 27 * s, 0.58f * s, color(0x475569), C2D_AlignCenter);
+            drawDialLimits(gauge, x + 92 * s, y + 39 * s, 37 * s, 0.25f * s, foreground);
+            text(gauge.unit.c_str(), x + 92 * s, y + 82 * s, 0.38f * s, foreground, C2D_AlignCenter);
         }
     };
-    drawPrimaryGauge(0, rpm, rpmValue, rpmFraction, sampleValid(rpm, samples));
-    drawPrimaryGauge(1, speed, speedValue, speedFraction, sampleValid(speed, samples));
 
-    const float cardWidth = 92.0f;
-    const float cardHeight = 43.0f;
-    for (size_t index = 2; index < dashboard.gauges.size(); ++index) {
+    auto drawSecondaryGauge = [&](size_t index) {
         const GaugeConfig& gauge = dashboard.gauges[index];
-        if (!settings.visible[index]) continue;
-        const float x = settings.x[index];
-        const float y = settings.y[index];
+        if (!settings.visible[index]) return;
+        const float s = settings.scale[index];
+        const float cardWidth = 92.0f * s;
+        const float cardHeight = 43.0f * s;
+        const float x = settings.x[index] - cardWidth * 0.5f;
+        const float y = settings.y[index] - cardHeight * 0.5f;
         const float value = valueFor(gauge, samples);
-        const bool valid = sampleValid(gauge, samples);
+        const bool valid = liveMode && sampleValid(gauge, samples);
         const u32 gaugeColor = statusColor(value, gauge, settings, index);
         const float fraction = valid ? std::clamp((value - gauge.min) / (gauge.max - gauge.min), 0.0f, 1.0f) : 0.0f;
         if (!settings.dial[index]) {
             C2D_DrawRectSolid(x, y, 0.0f, cardWidth, cardHeight, panel);
-            text(gauge.label.c_str(), x + 6, y + 4, 0.34f, foreground);
+            text(gauge.label.c_str(), x + 6 * s, y + 4 * s, 0.34f * s, foreground);
             if (valid) snprintf(valueText, sizeof(valueText), "%.1f %s", value, gauge.unit.c_str());
             else snprintf(valueText, sizeof(valueText), "-- %s", gauge.unit.c_str());
-            text(valueText, x + 6, y + 19, 0.39f, valid ? gaugeColor : color(0x475569));
-            C2D_DrawRectSolid(x + 6, y + 35, 0.0f, 80, 4, color(0x273449));
-            C2D_DrawRectSolid(x + 6, y + 35, 0.0f, 80.0f * fraction, 4, gaugeColor);
+            text(valueText, x + 6 * s, y + 19 * s, 0.39f * s, valid ? gaugeColor : color(0x475569));
+            C2D_DrawRectSolid(x + 6 * s, y + 35 * s, 0.0f, 80 * s, 4 * s, color(0x273449));
+            C2D_DrawRectSolid(x + 6 * s, y + 35 * s, 0.0f, 80.0f * s * fraction, 4 * s, gaugeColor);
         } else {
-            drawDial(x + 46, y + 25, 17, fraction, gaugeColor, foreground, panel);
-            text(gauge.label.c_str(), x + 46, y + 3, 0.27f, foreground, C2D_AlignCenter);
-            drawDialLimits(gauge, x + 46, y + 25, 17, 0.16f, foreground);
-            text(gauge.unit.c_str(), x + 46, y + 42, 0.28f, foreground, C2D_AlignCenter);
-                if (settings.selected == index) drawSelectionBorder(x + 10, y + 2, 72, 40);
+            drawDial(x + 46 * s, y + 25 * s, 17 * s, fraction, gaugeColor, foreground, panel);
+            text(gauge.label.c_str(), x + 46 * s, y + 3 * s, 0.27f * s, foreground, C2D_AlignCenter);
+            if (!valid) text("--", x + 46 * s, y + 17 * s, 0.34f * s, color(0x475569), C2D_AlignCenter);
+            drawDialLimits(gauge, x + 46 * s, y + 25 * s, 17 * s, 0.16f * s, foreground);
+            text(gauge.unit.c_str(), x + 46 * s, y + 42 * s, 0.28f * s, foreground, C2D_AlignCenter);
         }
+    };
+
+    // Draw non-selected gauges first, then selected last (on top)
+    for (size_t i = 0; i < 2; ++i) {
+        if (i == selectedGauge) continue;
+        drawPrimaryGauge(i, dashboard.gauges[i], valueFor(dashboard.gauges[i], samples),
+            std::clamp((valueFor(dashboard.gauges[i], samples) - dashboard.gauges[i].min) /
+            (dashboard.gauges[i].max - dashboard.gauges[i].min), 0.0f, 1.0f),
+            liveMode && sampleValid(dashboard.gauges[i], samples));
+    }
+    for (size_t index = 2; index < dashboard.gauges.size(); ++index) {
+        if (index == selectedGauge) continue;
+        drawSecondaryGauge(index);
+    }
+    // Selected gauge drawn last
+    if (selectedGauge < 2) {
+        const auto& g = dashboard.gauges[selectedGauge];
+        drawPrimaryGauge(selectedGauge, g, valueFor(g, samples),
+            std::clamp((valueFor(g, samples) - g.min) / (g.max - g.min), 0.0f, 1.0f),
+            liveMode && sampleValid(g, samples));
+    } else if (selectedGauge < dashboard.gauges.size()) {
+        drawSecondaryGauge(selectedGauge);
     }
 
     // Bottom screen: show the error takeover while disconnected, otherwise the normal editor.
-    const bool hasError = !liveMode && connectionError != nullptr && connectionError[0] != '\0';
+    const bool hasError = showConnectionError && !liveMode && connectionError != nullptr && connectionError[0] != '\0';
     if (hasError) {
         drawConnectionError(connectionError, localIp, settings.host, settings.port, errorScroll);
     } else {
@@ -259,7 +326,8 @@ void GuiRenderer::drawConnectionError(const char* connectionError, const char* l
 
     C2D_DrawRectSolid(0, 0, 0.0f, 320, 240, color(0x0B0F17));
     C2D_DrawRectSolid(8, 8, 0.0f, 304, 28, rgba(0x1F2937));
-    text("CONNECTION ERROR", 16, 16, 0.56f, errorRed);
+    text("X", 16, 14, 0.52f, errorRed);
+    text("CONNECTION ERROR", 34, 16, 0.56f, errorRed);
     text("BUILD " __DATE__ " " __TIME__, 306, 4, 0.38f, rgba(0x94A3B8), C2D_AlignRight);
 
     // Scrollable message area, so long diagnostics never get silently cut off.
@@ -308,11 +376,12 @@ void GuiRenderer::drawSettings(const DashboardData& dashboard, const GuiSettings
     const u32 panel = color(settings.panel);
     const u32 accent = color(settings.accent);
     const unsigned int selectedColor = settings.gaugeColor[selectedGauge];
+    const u32 borderGray = color(0x374151);
 
     C2D_DrawRectSolid(0, 0, 0.0f, 320, 240, color(0x0B0F17));
     C2D_DrawRectSolid(8, 8, 0.0f, 304, 28, panel);
     text("CUSTOMIZE DASHBOARD", 16, 14, 0.46f, foreground);
-    text(liveMode ? "LIVE" : "OFFLINE", 254, 14, 0.34f, liveMode ? color(0x34D399) : color(0xFBBF24));
+    text(liveMode ? "LIVE" : "OFFLINE", 244, 14, 0.32f, liveMode ? color(0x34D399) : color(0xFBBF24), C2D_AlignRight);
 
     if (confirmRevert) {
         C2D_DrawRectSolid(24, 68, 0.0f, 272, 112, panel);
@@ -324,24 +393,93 @@ void GuiRenderer::drawSettings(const DashboardData& dashboard, const GuiSettings
         return;
     }
 
-    text(settings.editMode ? "DONE" : "EDIT", 204, 14, 0.36f, accent);
-    text("RESET", 258, 14, 0.36f, color(0xFBBF24));
+    text(settings.editMode ? "DONE" : "EDIT", 162, 14, 0.36f, accent);
+    text("RESET", 302, 14, 0.36f, color(0xFBBF24), C2D_AlignRight);
 
     if (settings.editMode) {
-        text("EDIT MODE - DRAG GAUGES", 12, 43, 0.38f, accent);
+        // Proportional minimap: scale the 400x240 top screen into a ~300x140 edit area
+        constexpr float EDIT_SCALE = 0.58f;
+        constexpr float EDIT_OFFSET_X = 10.0f;
+        constexpr float EDIT_OFFSET_Y = 42.0f;
+
+        // Draw non-selected gauge boxes first, then selected on top
+        auto drawGaugeBox = [&](size_t index) {
+            const float s = settings.scale[index];
+            const float baseW = index < 2 ? 188.0f : 92.0f;
+            const float baseH = index < 2 ? 78.0f : 43.0f;
+            const float w = baseW * s * EDIT_SCALE;
+            const float h = baseH * s * EDIT_SCALE;
+            const float x = settings.x[index] * EDIT_SCALE + EDIT_OFFSET_X - w * 0.5f;
+            const float y = settings.y[index] * EDIT_SCALE + EDIT_OFFSET_Y - h * 0.5f;
+            C2D_DrawRectSolid(x, y, 0.0f, w, h, settings.visible[index] ? panel : color(0x252A33));
+            text(dashboard.gauges[index].label.c_str(), x + 4, y + 3, 0.28f, foreground);
+            C2D_DrawRectSolid(x, y, 0.1f, w, 1, borderGray);
+            C2D_DrawRectSolid(x, y + h - 1, 0.1f, w, 1, borderGray);
+            C2D_DrawRectSolid(x, y, 0.1f, 1, h, borderGray);
+            C2D_DrawRectSolid(x + w - 1, y, 0.1f, 1, h, borderGray);
+            if (index == selectedGauge && !settings.bannerSelected)
+                drawSelectionBorder(x, y, w, h);
+        };
+
+        auto drawBannerBox = [&]() {
+            const float bw = 384.0f * settings.bannerScale * EDIT_SCALE;
+            const float bh = 38.0f * settings.bannerScale * EDIT_SCALE;
+            const float bx = settings.bannerX * EDIT_SCALE + EDIT_OFFSET_X - bw * 0.5f;
+            const float by = settings.bannerY * EDIT_SCALE + EDIT_OFFSET_Y - bh * 0.5f;
+            C2D_DrawRectSolid(bx, by, 0.0f, bw, bh, settings.bannerVisible ? panel : color(0x252A33));
+            text("BANNER", bx + 4, by + 4, 0.30f, accent);
+            C2D_DrawRectSolid(bx, by, 0.1f, bw, 1, borderGray);
+            C2D_DrawRectSolid(bx, by + bh - 1, 0.1f, bw, 1, borderGray);
+            C2D_DrawRectSolid(bx, by, 0.1f, 1, bh, borderGray);
+            C2D_DrawRectSolid(bx + bw - 1, by, 0.1f, 1, bh, borderGray);
+            if (settings.bannerSelected) drawSelectionBorder(bx, by, bw, bh);
+        };
+
+        // Draw non-selected items first, selected item last (on top)
+        if (!settings.bannerSelected) drawBannerBox();
         for (size_t index = 0; index < dashboard.gauges.size(); ++index) {
-            const float x = settings.x[index] * 0.78f;
-            const float y = settings.y[index];
-            const float width = index < 2 ? 110.0f : 90.0f;
-            const float height = index < 2 ? 48.0f : 34.0f;
-            C2D_DrawRectSolid(x, y, 0.0f, width, height, settings.visible[index] ? panel : color(0x252A33));
-            text(dashboard.gauges[index].label.c_str(), x + 6, y + 7, index < 2 ? 0.48f : 0.42f, foreground);
+            if (index == selectedGauge && !settings.bannerSelected) continue;
+            if (settings.bannerSelected || index != selectedGauge) drawGaugeBox(index);
         }
-        text("Touch and drag  |  A toggle visibility", 36, 217, 0.30f, foreground);
+        // Draw selected item on top
+        if (settings.bannerSelected) drawBannerBox();
+        else drawGaugeBox(selectedGauge);
+
+        // --- Toolbar at bottom (y=190 to y=240) ---
+        C2D_DrawRectSolid(0, 188, 0.0f, 320, 1, borderGray);
+
+        // Scale slider
+        C2D_DrawRectSolid(8, 192, 0.0f, 18, 18, color(0x273449));
+        text("-", 17, 192, 0.62f, foreground, C2D_AlignCenter);
+        C2D_DrawRectSolid(30, 200, 0.0f, 96, 4, color(0x273449));
+        float currentScale = settings.bannerSelected ? settings.bannerScale : settings.scale[selectedGauge];
+        float sliderFill = (currentScale - 0.5f) / 1.5f;
+        if (sliderFill < 0.0f) sliderFill = 0.0f;
+        if (sliderFill > 1.0f) sliderFill = 1.0f;
+        C2D_DrawRectSolid(30, 200, 0.1f, 96.0f * sliderFill, 4, accent);
+        C2D_DrawRectSolid(128, 192, 0.0f, 18, 18, color(0x273449));
+        text("+", 137, 192, 0.62f, foreground, C2D_AlignCenter);
+        char scaleText[8];
+        snprintf(scaleText, sizeof(scaleText), "%.1fx", currentScale);
+        text(scaleText, 150, 194, 0.30f, foreground);
+
+        // Visibility toggle button
+        bool isVisible = settings.bannerSelected ? settings.bannerVisible : settings.visible[selectedGauge];
+        C2D_DrawRectSolid(174, 192, 0.0f, 60, 18, isVisible ? color(0x34D399) : color(0x4B5563));
+        text(isVisible ? "VISIBLE" : "HIDDEN", 204, 195, 0.28f, color(0x0B0F17), C2D_AlignCenter);
+
+        // Gauge style toggle button (not applicable to banner)
+        if (!settings.bannerSelected) {
+            bool isDial = settings.dial[selectedGauge];
+            C2D_DrawRectSolid(240, 192, 0.0f, 60, 18, isDial ? accent : color(0x4B5563));
+            text(isDial ? "DIAL" : "BAR", 270, 195, 0.28f, color(0x0B0F17), C2D_AlignCenter);
+        }
+
+        text("DRAG TO MOVE | L/R SELECT", 36, 224, 0.26f, foreground);
         return;
     }
-    text("TAP DIAL BOX FOR GAUGE STYLE", 12, 148, 0.31f, accent);
 
+    // Non-edit mode: gauge list + color picker (no dial toggle or visibility toggle here)
     text("SELECT GAUGE", 12, 43, 0.34f, foreground);
     for (size_t index = 0; index < dashboard.gauges.size(); ++index) {
         const float x = 10.0f + static_cast<float>(index % 2) * 154.0f;
@@ -349,10 +487,6 @@ void GuiRenderer::drawSettings(const DashboardData& dashboard, const GuiSettings
         const bool active = index == selectedGauge;
         C2D_DrawRectSolid(x, y, 0.0f, 146, 19, active ? accent : panel);
         text(dashboard.gauges[index].label.c_str(), x + 6, y + 3, 0.32f, foreground);
-        C2D_DrawRectSolid(x + 91, y + 4, 0.0f, 11, 11, foreground);
-        C2D_DrawRectSolid(x + 93, y + 6, 0.1f, 7, 7, panel);
-        if (settings.dial[index]) C2D_DrawRectSolid(x + 94, y + 7, 0.2f, 5, 5, accent);
-        text("DIAL", x + 105, y + 4, 0.20f, foreground);
         C2D_DrawRectSolid(x + 130, y + 4, 0.0f, 8, 11, color(settings.gaugeColor[index]));
     }
 
@@ -374,5 +508,5 @@ void GuiRenderer::drawSettings(const DashboardData& dashboard, const GuiSettings
     }
     snprintf(value, sizeof(value), "#%06X", selectedColor);
     text(value, 12, 229, 0.36f, accent);
-    text("A VISIBILITY  |  TOUCH RGB", 94, 229, 0.28f, foreground);
+    text("TOUCH RGB TO ADJUST", 94, 229, 0.28f, foreground);
 }

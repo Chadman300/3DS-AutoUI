@@ -20,16 +20,23 @@ struct GuiSettings {
     unsigned int gaugeColor[10];
     float x[10];
     float y[10];
+    float scale[10];
+    float bannerX = 200.0f;
+    float bannerY = 27.0f;
+    float bannerScale = 1.0f;
+    bool bannerVisible = true;
+    bool bannerSelected = false;
     char host[16];
     unsigned int port = 35000;
 
     GuiSettings() {
-        // Gauges 0-1 are the large top cards; 2-9 form a 4-column x 2-row grid below.
-        const float defaultX[10] = {8, 204, 8, 106, 204, 302, 8, 106, 204, 302};
-        const float defaultY[10] = {54, 54, 140, 140, 140, 140, 190, 190, 190, 190};
+        // Default positions are center points of each gauge card
+        const float defaultX[10] = {102, 298, 54, 152, 250, 348, 54, 152, 250, 348};
+        const float defaultY[10] = {93, 93, 161.5f, 161.5f, 161.5f, 161.5f, 211.5f, 211.5f, 211.5f, 211.5f};
         for (unsigned int index = 0; index < 10; ++index) {
             visible[index] = true;
             dial[index] = false;
+            scale[index] = 1.0f;
             const unsigned int defaults[10] = {0xFF5A36, 0x60A5FA, 0xFBBF24, 0x34D399, 0xA78BFA,
                                                0xF472B6, 0x22D3EE, 0xFCD34D, 0xF97316, 0x38BDF8};
             gaugeColor[index] = defaults[index];
@@ -46,9 +53,11 @@ public:
     bool init();
     void shutdown();
     bool ready() const;
+    void drawLoading(unsigned int frame);
     void draw(const DashboardData& dashboard, const std::vector<GaugeSample>& samples,
               const GuiSettings& settings, bool liveMode, size_t selectedGauge, bool confirmRevert,
-              const char* connectionError = "", const char* localIp = "", float errorScroll = 0.0f);
+              bool showConnectionError, const char* connectionError = "", const char* localIp = "",
+              float errorScroll = 0.0f);
     void drawSettings(const DashboardData& dashboard, const GuiSettings& settings,
                       size_t selectedGauge, bool liveMode, bool confirmRevert);
     void drawConnectionError(const char* connectionError, const char* localIp, const char* targetHost,
