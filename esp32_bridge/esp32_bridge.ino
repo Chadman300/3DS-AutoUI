@@ -1,8 +1,17 @@
-// ESP32 Wi-Fi bridge between an ELM327 iCar Pro OBD2 adapter and the 3DS AutoUI app.
+// ESP32 Wi-Fi bridge between an ELM327 iCar Pro / V-LINK OBD2 adapter and the 3DS AutoUI app.
 //
-// The ESP32 runs in dual APSTA mode:
-//   * STA: joins the iCar Pro's own Wi-Fi network (the dongle stays in AP mode).
-//   * AP:  hosts a separate Wi-Fi network the 3DS connects to.
+// The ESP32 hosts a single Wi-Fi network (AP). Both the OBD adapter and the 3DS join it
+// as clients:
+//   * V-LINK/iCar Pro: configured (via its own app/settings) to join this AP as a Wi-Fi
+//     client instead of hosting its own network. It keeps running its own ELM327 TCP
+//     server, just at whatever IP the ESP32's DHCP hands it out.
+//   * 3DS: joins the same AP and connects to the ESP32 on port 35000.
+//
+// Because the adapter's IP is dynamic (DHCP), the ESP32 auto-discovers it at boot by
+// scanning the AP's small IP range and probing each address with an ELM327 handshake
+// (see discoverObdAdapter()). No STA/channel-matching is needed at all, which avoids the
+// classic ESP32 APSTA channel-mismatch bug where a softAP and a joined network end up on
+// different Wi-Fi channels and traffic silently stalls.
 //
 // A TCP proxy on port 35000 forwards raw ELM327 bytes in both directions and mirrors
 // every byte to the USB serial monitor so you can watch the live conversation.
@@ -29,21 +38,24 @@
 
 // ---------- User configuration -------------------------------------------------
 
-// iCar Pro Wi-Fi credentials. Most iCar Pro units broadcast an open SSID like
-// "WiFi_OBDII" or "V-LINK". Set OBD_PASS to "" for open networks.
-static const char* OBD_SSID = "WiFi_OBDII";
-static const char* OBD_PASS = "";
-
-// The iCar Pro's TCP endpoint on its own network.
-static const char*    OBD_HOST = "192.168.0.10";
-static const uint16_t OBD_PORT = 35000;
-
-// The AP the 3DS will join. Keep the password >= 8 chars or WPA2 will refuse it.
+// The AP both the OBD adapter and the 3DS join. Configure V-LINK's client mode with
+// this SSID/password. Keep the password >= 8 chars or WPA2 will refuse it.
 static const char* AP_SSID = "AutoUI-ESP32";
 static const char* AP_PASS = "autoui3ds";
 
-// TCP port the 3DS connects to on the ESP32's AP interface. Match the app default.
+// TCP port the 3DS connects to on the ESP32, and the port the OBD adapter listens on.
+static const uint16_t OBD_PORT = 35000;
 static const uint16_t LISTEN_PORT = 35000;
+
+// If you know the adapter's IP will always be the same (e.g. you gave it a static IP
+// in its client-mode settings), set it here to skip auto-discovery entirely. Leave ""
+// to auto-discover by scanning the AP subnet at boot.
+static const char* OBD_HOST_OVERRIDE = "";
+
+// Range of the last IP octet to probe during auto-discovery (matches the ESP32's
+// default AP subnet 192.168.4.0/24 with a handful of clients).
+static const int DISCOVERY_SCAN_START = 2;
+static const int DISCOVERY_SCAN_END = 20;
 
 // Set false if the serial mirror gets too chatty during real driving.
 static const bool VERBOSE_LOG = true;
@@ -51,6 +63,7 @@ static const bool VERBOSE_LOG = true;
 // -------------------------------------------------------------------------------
 
 static WiFiServer proxyServer(LISTEN_PORT);
+static String discoveredObdIp;  // cached result of discoverObdAdapter(), empty until found
 
 // 3DS Nintendo Wi-Fi connection test spoofing: DNS resolves every hostname to the
 // AP's own IP, and the HTTP server answers conntest.nintendowifi.net with the exact
@@ -93,23 +106,52 @@ static void logDirection(const char* tag, const uint8_t* data, size_t len) {
   Serial.println();
 }
 
-static bool joinObdNetwork() {
-  Serial.printf("[STA] Joining OBD network '%s'...\n", OBD_SSID);
-  WiFi.begin(OBD_SSID, OBD_PASS);
-  uint32_t started = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - started > 20000) {
-      Serial.println("[STA] Timeout joining OBD network.");
-      return false;
-    }
-    delay(250);
-    Serial.print('.');
+// Tries an ELM327 handshake against a single candidate IP. Returns true and logs the
+// reply if something answers on OBD_PORT and sends back any bytes.
+static bool probeCandidate(const IPAddress& ip) {
+  WiFiClient probe;
+  if (!probe.connect(ip, OBD_PORT, 400)) return false;
+  probe.print("ATZ\r");
+  uint32_t deadline = millis() + 600;
+  String reply;
+  while (millis() < deadline) {
+    while (probe.available()) reply += (char)probe.read();
+    if (reply.length() > 0) break;
+    delay(10);
   }
-  Serial.println();
-  Serial.printf("[STA] Connected. ESP32 IP on OBD net: %s (gateway %s)\n",
-                WiFi.localIP().toString().c_str(),
-                WiFi.gatewayIP().toString().c_str());
-  return true;
+  probe.stop();
+  if (reply.length() > 0) {
+    Serial.printf("[discover]   %s answered: %s\n", ip.toString().c_str(), reply.c_str());
+    return true;
+  }
+  return false;
+}
+
+// Scans the AP's small IP range looking for the OBD adapter, since its DHCP-assigned
+// IP isn't known ahead of time. Caches the result in discoveredObdIp on success.
+static bool discoverObdAdapter() {
+  if (OBD_HOST_OVERRIDE[0] != '\0') {
+    discoveredObdIp = OBD_HOST_OVERRIDE;
+    Serial.printf("[discover] Using configured OBD_HOST_OVERRIDE: %s\n", discoveredObdIp.c_str());
+    return true;
+  }
+
+  IPAddress apIp = WiFi.softAPIP();
+  Serial.printf("[discover] Scanning %s.%d-%d:%u for the OBD adapter (%d clients joined)...\n",
+                String(apIp[0]).c_str(), DISCOVERY_SCAN_START, DISCOVERY_SCAN_END, OBD_PORT,
+                WiFi.softAPgetStationNum());
+  for (int i = DISCOVERY_SCAN_START; i <= DISCOVERY_SCAN_END; ++i) {
+    IPAddress candidate(apIp[0], apIp[1], apIp[2], i);
+    if (candidate == apIp) continue;
+    if (probeCandidate(candidate)) {
+      discoveredObdIp = candidate.toString();
+      Serial.printf("[discover] Found OBD adapter at %s\n", discoveredObdIp.c_str());
+      return true;
+    }
+  }
+  Serial.println("[discover] No OBD adapter found this pass. Confirm V-LINK joined "
+                 "'AutoUI-ESP32' and the ignition/adapter is powered.");
+  return false;
 }
 
 static void startAccessPoint() {
@@ -129,7 +171,7 @@ static void startAccessPoint() {
   Serial.println("[AP]  DNS + captive portal HTTP server running.");
 }
 
-static bool relayHalfDuplex(WiFiClient& src, WiFiClient& dst, const char* tag) {
+static bool relayHalfDuplexCounted(WiFiClient& src, WiFiClient& dst, const char* tag, size_t& counter) {
   uint8_t buf[512];
   int avail = src.available();
   if (avail <= 0) return true;
@@ -142,33 +184,56 @@ static bool relayHalfDuplex(WiFiClient& src, WiFiClient& dst, const char* tag) {
     Serial.printf("[proxy] short write on %s: %d/%d\n", tag, written, n);
     return false;
   }
+  counter += (size_t)n;
   return true;
 }
 
 static void runProxySession(WiFiClient& threeds) {
-  Serial.println("[proxy] 3DS connected. Opening upstream to iCar Pro...");
+  if (discoveredObdIp.isEmpty() && !discoverObdAdapter()) {
+    Serial.println("[proxy] No known OBD adapter IP yet. Dropping 3DS.");
+    threeds.stop();
+    return;
+  }
+
+  Serial.printf("[proxy] 3DS connected from %s. Opening upstream to OBD adapter at %s:%u...\n",
+                threeds.remoteIP().toString().c_str(), discoveredObdIp.c_str(), OBD_PORT);
   WiFiClient obd;
-  if (!obd.connect(OBD_HOST, OBD_PORT)) {
-    Serial.printf("[proxy] Upstream connect to %s:%u failed. Dropping 3DS.\n",
-                  OBD_HOST, OBD_PORT);
+  if (!obd.connect(discoveredObdIp.c_str(), OBD_PORT)) {
+    Serial.printf("[proxy] Upstream connect to %s:%u failed. Adapter may have left the "
+                  "network or changed IP -- re-discovering.\n", discoveredObdIp.c_str(), OBD_PORT);
+    discoveredObdIp = "";
+    discoverObdAdapter();
     threeds.stop();
     return;
   }
   Serial.println("[proxy] Upstream established. Relaying...");
 
+  size_t bytesToObd = 0, bytesToThreeds = 0;
+  uint32_t lastActivity = millis();
+
   // Tight loop; ELM327 responses come in bursts terminated by '>'.
   while (threeds.connected() && obd.connected()) {
+    size_t beforeObd = bytesToObd, beforeThreeds = bytesToThreeds;
     bool ok = true;
-    ok &= relayHalfDuplex(threeds, obd, "[3DS->OBD]");
-    ok &= relayHalfDuplex(obd,    threeds, "[OBD->3DS]");
+    ok &= relayHalfDuplexCounted(threeds, obd, "[3DS->OBD]", bytesToObd);
+    ok &= relayHalfDuplexCounted(obd,    threeds, "[OBD->3DS]", bytesToThreeds);
     if (!ok) break;
+    if (bytesToObd != beforeObd || bytesToThreeds != beforeThreeds) {
+      lastActivity = millis();
+    } else if (millis() - lastActivity > 5000) {
+      Serial.printf("[proxy] No traffic for 5s (sent %u to OBD, %u to 3DS so far). "
+                    "3DS may be idle or the adapter may have stopped responding.\n",
+                    (unsigned)bytesToObd, (unsigned)bytesToThreeds);
+      lastActivity = millis();
+    }
     // Keep answering DNS/captive-portal checks even while a proxy session is open.
     dnsServer.processNextRequest();
     captivePortal.handleClient();
     delay(1);
   }
 
-  Serial.println("[proxy] Session closed.");
+  Serial.printf("[proxy] Session closed. Total bytes 3DS->OBD: %u, OBD->3DS: %u\n",
+                (unsigned)bytesToObd, (unsigned)bytesToThreeds);
   obd.stop();
   threeds.stop();
 }
@@ -179,15 +244,13 @@ void setup() {
   Serial.println();
   Serial.println("==== 3DS AutoUI ESP32 bridge ====");
 
-  WiFi.mode(WIFI_AP_STA);
-
+  WiFi.mode(WIFI_AP);
   startAccessPoint();
 
-  if (!joinObdNetwork()) {
-    // The AP stays up even without upstream, so the 3DS can still connect and
-    // see a "connect failed" message instead of nothing. Retry indefinitely.
-    Serial.println("[STA] Will keep retrying in the main loop.");
-  }
+  // Give V-LINK a few seconds to auto-associate and grab a DHCP lease before the
+  // first discovery pass.
+  delay(3000);
+  discoverObdAdapter();
 
   proxyServer.begin();
   proxyServer.setNoDelay(true);
@@ -196,13 +259,23 @@ void setup() {
 }
 
 void loop() {
-  // Keep STA link alive; iCar Pro APs sometimes drop clients on reset.
-  if (WiFi.status() != WL_CONNECTED) {
-    static uint32_t lastRetry = 0;
-    if (millis() - lastRetry > 5000) {
-      lastRetry = millis();
-      joinObdNetwork();
+  // Keep retrying discovery in the background until the adapter is found.
+  if (discoveredObdIp.isEmpty()) {
+    static uint32_t lastDiscoveryAttempt = 0;
+    if (millis() - lastDiscoveryAttempt > 10000) {
+      lastDiscoveryAttempt = millis();
+      discoverObdAdapter();
     }
+  }
+
+  // Heartbeat so you can confirm the AP and adapter link are alive without a 3DS session open.
+  static uint32_t lastHeartbeat = 0;
+  if (millis() - lastHeartbeat > 5000) {
+    lastHeartbeat = millis();
+    Serial.printf("[status] AP clients:%d OBD:%s heap:%u\n",
+                  WiFi.softAPgetStationNum(),
+                  discoveredObdIp.isEmpty() ? "not found" : discoveredObdIp.c_str(),
+                  (unsigned)ESP.getFreeHeap());
   }
 
   dnsServer.processNextRequest();

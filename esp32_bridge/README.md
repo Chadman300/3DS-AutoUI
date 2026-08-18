@@ -1,21 +1,27 @@
 # ESP32 OBD Bridge
 
 Replaces the iPhone / laptop middle-device in the 3DS AutoUI setup. The ESP32
-joins the iCar Pro's Wi-Fi as a client and simultaneously hosts its own Wi-Fi
-network for the 3DS. Traffic on TCP port 35000 is proxied byte-for-byte, and a
+hosts a single Wi-Fi network. Both the V-LINK/iCar Pro OBD adapter and the 3DS
+join it as clients. Traffic on TCP port 35000 is proxied byte-for-byte, and a
 copy is mirrored to the USB serial monitor for live debugging. A built-in DNS +
 HTTP captive portal spoofs the 3DS's internet connection test, since the 3DS
 refuses to stay associated with a Wi-Fi network that fails that check.
 
 ```
 +-----------+       +------------------+       +----------+
-| iCar Pro  |  Wi-Fi| ESP32 (APSTA)    |  Wi-Fi|  3DS     |
-| 192.168.0.10:35000|<--- STA joins    |       |          |
-|           |       |  AP: AutoUI-ESP32|<----->| 192.168.4.1:35000
+| V-LINK/   |  Wi-Fi|  ESP32 (AP only) |  Wi-Fi|  3DS     |
+| iCar Pro  |------>|  AutoUI-ESP32    |<----->| 192.168.4.1:35000
+| (client)  |       |  192.168.4.1     |       |          |
 +-----------+       +------------------+       +----------+
                           |
                           +--> USB Serial (115200 baud) live log
 ```
+
+The OBD adapter's IP is dynamic (DHCP), so the ESP32 auto-discovers it at boot
+by scanning the AP's subnet and probing each address with an ELM327 handshake.
+This single-AP design avoids the classic ESP32 dual-role (APSTA) bug where a
+hosted AP and a joined network end up on mismatched Wi-Fi channels, silently
+stalling traffic.
 
 ## Hardware
 
@@ -34,23 +40,32 @@ Install the Arduino IDE 2.x and add the ESP32 board package:
 
 PlatformIO works too — just point it at `esp32_bridge.ino` with framework `arduino`.
 
+## Configuring V-LINK to join the ESP32
+
+Use V-LINK's own app/settings to switch it from hosting its own network to
+joining an existing one as a client:
+
+1. SSID: `AutoUI-ESP32`
+2. Password: `autoui3ds`
+
+If V-LINK's settings let you assign it a static/fixed IP in client mode, do
+that and set `OBD_HOST_OVERRIDE` in the sketch (see below) — it skips
+auto-discovery entirely and is the most reliable option. Otherwise leave it on
+DHCP; the ESP32 will find it automatically.
+
 ## Configuration
 
 Edit the top of [`esp32_bridge.ino`](esp32_bridge.ino):
 
-| Constant   | Meaning                                      | Default          |
-|------------|----------------------------------------------|------------------|
-| OBD_SSID   | The iCar Pro's own Wi-Fi SSID                | `WiFi_OBDII`     |
-| OBD_PASS   | iCar Pro password (empty for open networks)  | `""`             |
-| OBD_HOST   | iCar Pro's TCP IP on its own AP              | `192.168.0.10`   |
-| OBD_PORT   | ELM327 TCP port                              | `35000`          |
-| AP_SSID    | Network the 3DS joins                        | `AutoUI-ESP32`   |
-| AP_PASS    | Password for the 3DS network (>= 8 chars)    | `autoui3ds`      |
-| LISTEN_PORT| Port the 3DS connects to on the ESP32        | `35000`          |
-| VERBOSE_LOG| Mirror bytes to serial monitor               | `true`           |
-
-Confirm your iCar Pro SSID by looking at the sticker on the dongle or scanning
-Wi-Fi networks with the ignition on.
+| Constant            | Meaning                                              | Default          |
+|---------------------|-------------------------------------------------------|------------------|
+| AP_SSID             | Network both V-LINK and the 3DS join                 | `AutoUI-ESP32`   |
+| AP_PASS             | Password for that network (>= 8 chars)               | `autoui3ds`      |
+| OBD_PORT            | ELM327 TCP port on the adapter                       | `35000`          |
+| LISTEN_PORT         | Port the 3DS connects to on the ESP32                | `35000`          |
+| OBD_HOST_OVERRIDE   | Skip auto-discovery; use this fixed IP instead       | `""` (auto)      |
+| DISCOVERY_SCAN_START/END | Last-octet range probed during discovery        | `2`-`20`         |
+| VERBOSE_LOG         | Mirror bytes to serial monitor                       | `true`           |
 
 ## 3DS internet connection test spoofing
 
@@ -74,20 +89,25 @@ so you can confirm the 3DS is hitting the expected hostname.
 1. Plug the ESP32 into your PC, pick the right COM port under `Tools > Port`.
 2. Click Upload.
 3. Open `Tools > Serial Monitor` at **115200 baud**.
-4. Power the iCar Pro (ignition on).
+4. Power the OBD adapter (ignition on) so it can join the ESP32's network.
 5. You should see the ESP32 log:
    ```
    [AP]  Starting AP 'AutoUI-ESP32'...
    [AP]  3DS should connect to 'AutoUI-ESP32' and target 192.168.4.1:35000
-   [STA] Joining OBD network 'WiFi_OBDII'...
-   [STA] Connected. ESP32 IP on OBD net: 192.168.0.11 (gateway 192.168.0.10)
+   [AP]  DNS + captive portal HTTP server running.
+   [discover] Scanning 192.168.4.2-20:35000 for the OBD adapter (1 clients joined)...
+   [discover]   192.168.4.2 answered: ELM327 v1.5
+   [discover] Found OBD adapter at 192.168.4.2
    [proxy] Listening on 192.168.4.1:35000
    ```
+   If discovery doesn't find it on the first pass (adapter still booting), the
+   sketch retries automatically every 10s — watch for `[discover]` lines in
+   the background `[status]` heartbeat.
 
 ## On the 3DS
 
 1. In the 3DS Wi-Fi settings, join `AutoUI-ESP32` (password `autoui3ds`).
-2. Launch AutoUI. The default host is now `192.168.4.1:35000` — no edit needed
+2. Launch AutoUI. The default host is `192.168.4.1:35000` — no edit needed
    unless you changed the ESP32 defaults.
 3. You should see `OBD2: connected` on the bottom screen and the top screen
    should start updating a couple times per second.
@@ -114,12 +134,18 @@ driving.
 
 ## Troubleshooting
 
-- **`[STA] Timeout joining OBD network.`** — Wrong SSID/password, or the iCar Pro
-  isn't powered. The AP stays up so you can still connect the 3DS and read the
-  error message.
-- **`[proxy] Upstream connect to 192.168.0.10:35000 failed.`** — The ESP32 joined
-  the OBD network but the dongle isn't answering. Check `OBD_HOST` matches the
-  gateway address shown in the STA log (some iCar Pro clones use `192.168.4.1`).
+- **`[discover] No OBD adapter found this pass.`** — V-LINK hasn't joined
+  `AutoUI-ESP32` yet, is unpowered, or its client-mode SSID/password is wrong.
+  Check the `AP clients:` count in the `[status]` heartbeat — if it's `0`,
+  V-LINK never associated.
+- **`[proxy] Upstream connect ... failed.`** — The adapter answered discovery
+  earlier but has since dropped off (power cycle, moved out of range). The
+  sketch clears the cached IP and re-scans automatically on the next attempt.
+- **Discovery keeps failing but `AP clients:` shows 1+** — The adapter may not
+  be listening on port 35000 in client mode, or it needs a moment after
+  associating before its ELM327 server comes up. Widen
+  `DISCOVERY_SCAN_START`/`END` if your AP subnet has more than ~20 possible
+  clients, or set `OBD_HOST_OVERRIDE` if you can pin a static IP on V-LINK.
 - **3DS shows connect timeout** — Make sure the 3DS actually joined `AutoUI-ESP32`
   and not your home Wi-Fi. The 3DS system Wi-Fi settings can remember multiple
   networks and pick the wrong one.
