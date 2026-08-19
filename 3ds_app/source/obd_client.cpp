@@ -433,3 +433,46 @@ void ObdClient::setPidEnabled(const char* gaugeId, bool enabled) {
         }
     }
 }
+
+bool ObdClient::queryVin(std::string& vin) {
+    vin.clear();
+    std::string response;
+    // Mode 09 PID 02 (VIN) triggers a multi-frame reply; give it more time than a
+    // regular single-frame Mode 01 query.
+    if (!sendCommand("0902", response)) return false;
+    if (response.find("NODATA") != std::string::npos || response.find("ERROR") != std::string::npos) {
+        return false;
+    }
+
+    // sendCommand() already stripped \r, \n, spaces, and '>'. What's left is the hex
+    // stream, still split by ISO-TP frame markers like "0:", "1:", "2:" -- drop those.
+    std::string hex;
+    hex.reserve(response.size());
+    for (size_t i = 0; i < response.size(); ++i) {
+        char c = response[i];
+        if (isHex(c)) hex.push_back(c);
+        // Skip a leading frame-index digit immediately followed by ':' (e.g. "1:").
+        else if (c == ':' && !hex.empty() && isHex(hex.back())) {
+            // The digit just before ':' was actually a frame index, not VIN data; drop it.
+            hex.pop_back();
+        }
+    }
+
+    // Response payload is "49 02 01 <17 ASCII bytes>": mode+0x40, PID, item count, then VIN.
+    const std::string marker = "490201";
+    size_t start = hex.find(marker);
+    if (start == std::string::npos) return false;
+    start += marker.size();
+
+    std::string decoded;
+    for (size_t i = start; i + 1 < hex.size() && decoded.size() < 17; i += 2) {
+        int value = 0;
+        if (!readHex(hex.c_str() + i, 2, value)) break;
+        if (value == 0) continue;  // padding
+        decoded.push_back(static_cast<char>(value));
+    }
+
+    if (decoded.size() < 11) return false;  // too short to be a real VIN
+    vin = decoded;
+    return true;
+}
