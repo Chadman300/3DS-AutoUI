@@ -1,289 +1,518 @@
-// ESP32 Wi-Fi bridge between an ELM327 iCar Pro / V-LINK OBD2 adapter and the 3DS AutoUI app.
+// ESP32 OBD cache bridge for the 3DS AutoUI app.
 //
-// The ESP32 hosts a single Wi-Fi network (AP). Both the OBD adapter and the 3DS join it
-// as clients:
-//   * V-LINK/iCar Pro: configured (via its own app/settings) to join this AP as a Wi-Fi
-//     client instead of hosting its own network. It keeps running its own ELM327 TCP
-//     server, just at whatever IP the ESP32's DHCP hands it out.
-//   * 3DS: joins the same AP and connects to the ESP32 on port 35000.
+// Architecture (dual-core):
 //
-// Because the adapter's IP is dynamic (DHCP), the ESP32 auto-discovers it at boot by
-// scanning the AP's small IP range and probing each address with an ELM327 handshake
-// (see discoverObdAdapter()). No STA/channel-matching is needed at all, which avoids the
-// classic ESP32 APSTA channel-mismatch bug where a softAP and a joined network end up on
-// different Wi-Fi channels and traffic silently stalls.
+//   Core 0 - obdPollingTask (FreeRTOS task):
+//     Connects to the V-LINK adapter, polls all OBD PIDs as fast as the ECU allows,
+//     and stores the latest raw response bytes in pidCache[]. Uses weighted scheduling
+//     so fast-changing gauges (RPM, speed, boost, throttle) are polled twice as often.
 //
-// A TCP proxy on port 35000 forwards raw ELM327 bytes in both directions and mirrors
-// every byte to the USB serial monitor so you can watch the live conversation.
+//   Core 1 - Arduino loop / handle3dsClient:
+//     The 3DS connects to the ESP32 on port 35000 and issues standard ELM327 commands
+//     (ATZ, ATE0, 010C, ...). AT commands and PID queries are answered INSTANTLY from
+//     the local cache -- no round-trip to the car. The 3DS sees a perfectly normal
+//     ELM327 adapter and requires zero code changes.
 //
-// A DNS server (port 53) resolves every hostname to the ESP32's AP address, and a
-// tiny HTTP server (port 80) answers the 3DS's connection test at
-// conntest.nintendowifi.net so the 3DS believes the network has working internet.
-// Without this, the 3DS refuses to treat the AP as usable and won't stay connected.
+// No changes to the 3DS app are required. The ELM327 response format is identical.
+// The only visible difference is that PID queries return immediately instead of waiting
+// ~80ms for the ECU, so the 3DS can poll at its full 15ms inter-query rate (~11 Hz on
+// RPM/speed/boost/throttle vs. 1-2 Hz with the old pass-through relay).
 //
-// Board: any ESP32 dev board (WROOM-32, S2, S3, C3 all work). Arduino-ESP32 core.
+// Also hosts:
+//   * DNS (port 53):  wildcard -> 192.168.4.1 (makes all hostnames resolve to us).
+//   * HTTP (port 80): answers conntest.nintendowifi.net so the 3DS passes its
+//                     internet-connection test and stays associated.
+//
+// Board: any ESP32 dev board (WROOM-32, S2, S3, C3). Arduino-ESP32 core.
 //
 // ---------------------------------------------------------------------------
 // TODO (future vehicles):
 //   [ ] 2002 Lexus IS300 profile:
 //       - Add config/lexus_is300_profile.json (NA 2JZ-GE, no boost gauge, redline ~6600).
 //       - Replace boost gauge slot with MAP kPa or vacuum inHg.
-//       - Confirm OBD2 support: 2002 IS300 is OBD2/CAN-lite; PID 05/0C/0D/0F/11/04/2F/42 all standard.
-//       - PID 5C (oil temp) may return NO DATA on the 2JZ-GE; the gauge will just stay invalid.
+//       - IS300 uses ISO 9141-2; standard Mode 01 PIDs 05/0C/0D/0F/11/04/2F/42 work.
+//       - PID 5C (oil temp) may return NO DATA on the 2JZ-GE; gauge stays blank.
 // ---------------------------------------------------------------------------
 
 #include <WiFi.h>
 #include <DNSServer.h>
 #include <WebServer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+#include <cstring>
 
 // ---------- User configuration -------------------------------------------------
 
-// The AP both the OBD adapter and the 3DS join. Configure V-LINK's client mode with
-// this SSID/password. Keep the password >= 8 chars or WPA2 will refuse it.
-static const char* AP_SSID = "AutoUI-ESP32";
-static const char* AP_PASS = "autoui3ds";
+// The AP both V-LINK and the 3DS join. Set V-LINK client mode to this SSID/password.
+static const char*    AP_SSID              = "AutoUI-ESP32";
+static const char*    AP_PASS              = "autoui3ds";
 
-// TCP port the 3DS connects to on the ESP32, and the port the OBD adapter listens on.
-static const uint16_t OBD_PORT = 35000;
-static const uint16_t LISTEN_PORT = 35000;
+// ELM327 TCP port (same on V-LINK and on the ESP32's server for the 3DS).
+static const uint16_t OBD_PORT             = 35000;
+static const uint16_t LISTEN_PORT          = 35000;
 
-// If you know the adapter's IP will always be the same (e.g. you gave it a static IP
-// in its client-mode settings), set it here to skip auto-discovery entirely. Leave ""
-// to auto-discover by scanning the AP subnet at boot.
-static const char* OBD_HOST_OVERRIDE = "";
+// Set this to skip auto-discovery and use a fixed IP for V-LINK (most reliable).
+// Leave "" to auto-discover by scanning the AP subnet at boot.
+static const char*    OBD_HOST_OVERRIDE    = "";
 
-// Range of the last IP octet to probe during auto-discovery (matches the ESP32's
-// default AP subnet 192.168.4.0/24 with a handful of clients).
-static const int DISCOVERY_SCAN_START = 2;
-static const int DISCOVERY_SCAN_END = 20;
+// Last-octet range probed during discovery (default AP subnet is 192.168.4.x).
+static const int      DISCOVERY_SCAN_START = 2;
+static const int      DISCOVERY_SCAN_END   = 20;
 
-// Set false if the serial mirror gets too chatty during real driving.
-static const bool VERBOSE_LOG = true;
+// Serve NO DATA to the 3DS for any cache entry older than this.
+static const uint32_t CACHE_STALE_MS       = 5000;
+
+// Set false to silence byte-level serial logging during real driving.
+static const bool     VERBOSE_LOG          = true;
 
 // -------------------------------------------------------------------------------
 
-static WiFiServer proxyServer(LISTEN_PORT);
-static String discoveredObdIp;  // cached result of discoverObdAdapter(), empty until found
+// PID table. Indices 0-3 = HIGH priority (fast-changing, polled 2/3 of the time).
+//           Indices 4-9 = LOW priority (slow-changing, polled 1/3 of the time).
+struct ObdPid { const char* hex; const char* name; bool word; };
+static constexpr size_t kObdPidCount = 10;
+static constexpr size_t kHighCount   =  4;
+static constexpr size_t kLowCount    =  6;
 
-// 3DS Nintendo Wi-Fi connection test spoofing: DNS resolves every hostname to the
-// AP's own IP, and the HTTP server answers conntest.nintendowifi.net with the exact
-// response the 3DS expects so it treats this network as internet-connected.
-static const byte DNS_PORT = 53;
-static DNSServer dnsServer;
-static WebServer captivePortal(80);
+static const ObdPid kObdPids[kObdPidCount] = {
+    // HIGH priority
+    {"0C", "rpm",             true },
+    {"0D", "speed",           false},
+    {"0B", "boost_map",       false},
+    {"11", "throttle",        false},
+    // LOW priority
+    {"05", "coolant_temp",    false},
+    {"0F", "intake_temp",     false},
+    {"04", "engine_load",     false},
+    {"2F", "fuel_level",      false},
+    {"42", "battery_voltage", true },
+    {"5C", "oil_temp",        false},
+};
+
+struct CacheSlot { uint8_t b[2]; bool valid; uint32_t ts; };
+static CacheSlot         pidCache[kObdPidCount];
+static SemaphoreHandle_t cacheMutex;
+static String            discoveredObdIp;   // guarded by cacheMutex
+
+// A PID that returns NO DATA/ERROR this many times in a row is almost certainly
+// unsupported by the vehicle (e.g. no boost/MAP sensor) -- stop asking for it so real
+// ECU round trips go to PIDs that actually answer.
+static const int kAutoDisableThreshold = 8;
+static bool      pidSupported[kObdPidCount];
+static int       pidNoDataStreak[kObdPidCount];
+
+static WiFiServer  proxyServer(LISTEN_PORT);
+static const byte  DNS_PORT = 53;
+static DNSServer   dnsServer;
+static WebServer   captivePortal(80);
+
+
+// ---- Captive portal (Nintendo connection test) --------------------------------
 
 static void handleCaptivePortalRequest() {
-  Serial.println("=== HTTP REQUEST ===");
-  Serial.printf("URI: %s\n", captivePortal.uri().c_str());
-  Serial.printf("Host header: %s\n", captivePortal.hostHeader().c_str());
-  Serial.println("=====================");
-
-  if (captivePortal.hostHeader() == "conntest.nintendowifi.net") {
-    const char* html =
-        "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" "
-        "\"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">"
-        "<html><head><title>HTML Page</title></head>"
-        "<body bgcolor=\"#FFFFFF\">This is test.html page</body></html>";
-    captivePortal.sendHeader("X-Organization", "Nintendo");
-    captivePortal.send(200, "text/html", html);
-    return;
-  }
-
-  captivePortal.send(200, "text/plain", "OK");
-}
-
-static void logDirection(const char* tag, const uint8_t* data, size_t len) {
-  if (!VERBOSE_LOG || len == 0) return;
-  Serial.printf("%s (%u): ", tag, (unsigned)len);
-  for (size_t i = 0; i < len; ++i) {
-    uint8_t b = data[i];
-    // Show printable ASCII inline (ELM327 is text-based) and escape control bytes.
-    if (b == '\r')      Serial.print("\\r");
-    else if (b == '\n') Serial.print("\\n");
-    else if (b >= 0x20 && b < 0x7f) Serial.write(b);
-    else Serial.printf("\\x%02X", b);
-  }
-  Serial.println();
-}
-
-// Tries an ELM327 handshake against a single candidate IP. Returns true and logs the
-// reply if something answers on OBD_PORT and sends back any bytes.
-static bool probeCandidate(const IPAddress& ip) {
-  WiFiClient probe;
-  if (!probe.connect(ip, OBD_PORT, 400)) return false;
-  probe.print("ATZ\r");
-  uint32_t deadline = millis() + 600;
-  String reply;
-  while (millis() < deadline) {
-    while (probe.available()) reply += (char)probe.read();
-    if (reply.length() > 0) break;
-    delay(10);
-  }
-  probe.stop();
-  if (reply.length() > 0) {
-    Serial.printf("[discover]   %s answered: %s\n", ip.toString().c_str(), reply.c_str());
-    return true;
-  }
-  return false;
-}
-
-// Scans the AP's small IP range looking for the OBD adapter, since its DHCP-assigned
-// IP isn't known ahead of time. Caches the result in discoveredObdIp on success.
-static bool discoverObdAdapter() {
-  if (OBD_HOST_OVERRIDE[0] != '\0') {
-    discoveredObdIp = OBD_HOST_OVERRIDE;
-    Serial.printf("[discover] Using configured OBD_HOST_OVERRIDE: %s\n", discoveredObdIp.c_str());
-    return true;
-  }
-
-  IPAddress apIp = WiFi.softAPIP();
-  Serial.printf("[discover] Scanning %s.%d-%d:%u for the OBD adapter (%d clients joined)...\n",
-                String(apIp[0]).c_str(), DISCOVERY_SCAN_START, DISCOVERY_SCAN_END, OBD_PORT,
-                WiFi.softAPgetStationNum());
-  for (int i = DISCOVERY_SCAN_START; i <= DISCOVERY_SCAN_END; ++i) {
-    IPAddress candidate(apIp[0], apIp[1], apIp[2], i);
-    if (candidate == apIp) continue;
-    if (probeCandidate(candidate)) {
-      discoveredObdIp = candidate.toString();
-      Serial.printf("[discover] Found OBD adapter at %s\n", discoveredObdIp.c_str());
-      return true;
+    Serial.println("=== HTTP REQUEST ===");
+    Serial.printf("URI: %s\n", captivePortal.uri().c_str());
+    Serial.printf("Host: %s\n", captivePortal.hostHeader().c_str());
+    Serial.println("===================");
+    if (captivePortal.hostHeader() == "conntest.nintendowifi.net") {
+        const char* html =
+            "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" "
+            "\"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">"
+            "<html><head><title>HTML Page</title></head>"
+            "<body bgcolor=\"#FFFFFF\">This is test.html page</body></html>";
+        captivePortal.sendHeader("X-Organization", "Nintendo");
+        captivePortal.send(200, "text/html", html);
+        return;
     }
-  }
-  Serial.println("[discover] No OBD adapter found this pass. Confirm V-LINK joined "
-                 "'AutoUI-ESP32' and the ignition/adapter is powered.");
-  return false;
+    captivePortal.send(200, "text/plain", "OK");
 }
+
+
+// ---- OBD adapter discovery ----------------------------------------------------
+
+static bool probeCandidate(const IPAddress& ip) {
+    WiFiClient probe;
+    if (!probe.connect(ip, OBD_PORT, 400)) return false;
+    probe.print("ATZ\r");
+    uint32_t deadline = millis() + 600;
+    String reply;
+    while (millis() < deadline) {
+        while (probe.available()) reply += (char)probe.read();
+        if (reply.length() > 0) break;
+        delay(10);
+    }
+    probe.stop();
+    if (reply.length() > 0) {
+        Serial.printf("[discover]   %s replied\n", ip.toString().c_str());
+        return true;
+    }
+    return false;
+}
+
+static bool discoverObdAdapter() {
+    if (OBD_HOST_OVERRIDE[0] != '\0') {
+        xSemaphoreTake(cacheMutex, portMAX_DELAY);
+        discoveredObdIp = OBD_HOST_OVERRIDE;
+        xSemaphoreGive(cacheMutex);
+        Serial.printf("[discover] Using OBD_HOST_OVERRIDE: %s\n", OBD_HOST_OVERRIDE);
+        return true;
+    }
+    IPAddress apIp = WiFi.softAPIP();
+    Serial.printf("[discover] Scanning .%d-.%d on port %u (%d clients joined)...\n",
+                  DISCOVERY_SCAN_START, DISCOVERY_SCAN_END,
+                  OBD_PORT, WiFi.softAPgetStationNum());
+    for (int i = DISCOVERY_SCAN_START; i <= DISCOVERY_SCAN_END; ++i) {
+        IPAddress candidate(apIp[0], apIp[1], apIp[2], i);
+        if (candidate == apIp) continue;
+        if (probeCandidate(candidate)) {
+            xSemaphoreTake(cacheMutex, portMAX_DELAY);
+            discoveredObdIp = candidate.toString();
+            xSemaphoreGive(cacheMutex);
+            Serial.printf("[discover] Found OBD adapter at %s\n", candidate.toString().c_str());
+            return true;
+        }
+    }
+    Serial.println("[discover] Not found. Check V-LINK joined 'AutoUI-ESP32' and ignition is on.");
+    return false;
+}
+
+
+// ---- AP setup -----------------------------------------------------------------
 
 static void startAccessPoint() {
-  Serial.printf("[AP]  Starting AP '%s'...\n", AP_SSID);
-  WiFi.softAP(AP_SSID, AP_PASS);
-  delay(200);
-  IPAddress apIP = WiFi.softAPIP();
-  Serial.printf("[AP]  3DS should connect to '%s' and target %s:%u\n",
-                AP_SSID, apIP.toString().c_str(), LISTEN_PORT);
-
-  // Wildcard DNS: every lookup (including conntest.nintendowifi.net) resolves to us.
-  dnsServer.start(DNS_PORT, "*", apIP);
-
-  captivePortal.onNotFound(handleCaptivePortalRequest);
-  captivePortal.on("/", handleCaptivePortalRequest);
-  captivePortal.begin();
-  Serial.println("[AP]  DNS + captive portal HTTP server running.");
+    Serial.printf("[AP] Starting '%s'...\n", AP_SSID);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    delay(200);
+    IPAddress apIP = WiFi.softAPIP();
+    Serial.printf("[AP] %s   3DS target: %s:%u\n",
+                  apIP.toString().c_str(), apIP.toString().c_str(), LISTEN_PORT);
+    dnsServer.start(DNS_PORT, "*", apIP);
+    captivePortal.onNotFound(handleCaptivePortalRequest);
+    captivePortal.on("/", handleCaptivePortalRequest);
+    captivePortal.begin();
+    Serial.println("[AP] DNS + captive portal running.");
 }
 
-static bool relayHalfDuplexCounted(WiFiClient& src, WiFiClient& dst, const char* tag, size_t& counter) {
-  uint8_t buf[512];
-  int avail = src.available();
-  if (avail <= 0) return true;
-  int toRead = avail > (int)sizeof(buf) ? (int)sizeof(buf) : avail;
-  int n = src.read(buf, toRead);
-  if (n <= 0) return true;
-  logDirection(tag, buf, (size_t)n);
-  int written = dst.write(buf, (size_t)n);
-  if (written != n) {
-    Serial.printf("[proxy] short write on %s: %d/%d\n", tag, written, n);
-    return false;
-  }
-  counter += (size_t)n;
-  return true;
-}
 
-static void runProxySession(WiFiClient& threeds) {
-  if (discoveredObdIp.isEmpty() && !discoverObdAdapter()) {
-    Serial.println("[proxy] No known OBD adapter IP yet. Dropping 3DS.");
-    threeds.stop();
-    return;
-  }
+// ---- Background OBD polling task (pinned to Core 0) ---------------------------
 
-  Serial.printf("[proxy] 3DS connected from %s. Opening upstream to OBD adapter at %s:%u...\n",
-                threeds.remoteIP().toString().c_str(), discoveredObdIp.c_str(), OBD_PORT);
-  WiFiClient obd;
-  if (!obd.connect(discoveredObdIp.c_str(), OBD_PORT)) {
-    Serial.printf("[proxy] Upstream connect to %s:%u failed. Adapter may have left the "
-                  "network or changed IP -- re-discovering.\n", discoveredObdIp.c_str(), OBD_PORT);
-    discoveredObdIp = "";
-    discoverObdAdapter();
-    threeds.stop();
-    return;
-  }
-  Serial.println("[proxy] Upstream established. Relaying...");
-
-  size_t bytesToObd = 0, bytesToThreeds = 0;
-  uint32_t lastActivity = millis();
-
-  // Tight loop; ELM327 responses come in bursts terminated by '>'.
-  while (threeds.connected() && obd.connected()) {
-    size_t beforeObd = bytesToObd, beforeThreeds = bytesToThreeds;
-    bool ok = true;
-    ok &= relayHalfDuplexCounted(threeds, obd, "[3DS->OBD]", bytesToObd);
-    ok &= relayHalfDuplexCounted(obd,    threeds, "[OBD->3DS]", bytesToThreeds);
-    if (!ok) break;
-    if (bytesToObd != beforeObd || bytesToThreeds != beforeThreeds) {
-      lastActivity = millis();
-    } else if (millis() - lastActivity > 5000) {
-      Serial.printf("[proxy] No traffic for 5s (sent %u to OBD, %u to 3DS so far). "
-                    "3DS may be idle or the adapter may have stopped responding.\n",
-                    (unsigned)bytesToObd, (unsigned)bytesToThreeds);
-      lastActivity = millis();
+// Read from a WiFiClient until '>' arrives or timeoutMs elapses.
+// Uses vTaskDelay so it yields correctly inside a FreeRTOS task.
+static bool readUntilPrompt(WiFiClient& c, String& out, uint32_t timeoutMs) {
+    out = "";
+    uint32_t deadline = millis() + timeoutMs;
+    while (millis() < deadline) {
+        while (c.available()) {
+            char ch = (char)c.read();
+            out += ch;
+            if (ch == '>') return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
-    // Keep answering DNS/captive-portal checks even while a proxy session is open.
-    dnsServer.processNextRequest();
-    captivePortal.handleClient();
-    delay(1);
-  }
-
-  Serial.printf("[proxy] Session closed. Total bytes 3DS->OBD: %u, OBD->3DS: %u\n",
-                (unsigned)bytesToObd, (unsigned)bytesToThreeds);
-  obd.stop();
-  threeds.stop();
+    return false;
 }
+
+static bool elmSend(WiFiClient& c, const char* cmd, String& out, uint32_t timeoutMs = 2000) {
+    String s = cmd;
+    s += '\r';
+    if ((size_t)c.print(s) != s.length()) return false;
+    return readUntilPrompt(c, out, timeoutMs);
+}
+
+// Extract raw value bytes from an ELM327 mode-01 response.
+// Strips spaces, finds "41<pid>", reads 2 or 4 hex chars. Returns byte count (1 or 2) or 0.
+static int parseObdBytes(const String& resp, const char* pidHex, uint8_t out[2]) {
+    String r = resp;
+    r.replace(" ", "");
+    r.toUpperCase();
+    String marker = "41";
+    marker += pidHex;
+    int idx = r.indexOf(marker);
+    if (idx < 0) return 0;
+    const char* p = r.c_str() + idx + marker.length();
+    auto hv = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    if (hv(p[0]) < 0 || hv(p[1]) < 0) return 0;
+    out[0] = (uint8_t)((hv(p[0]) << 4) | hv(p[1]));
+    if (hv(p[2]) >= 0 && hv(p[3]) >= 0) {
+        out[1] = (uint8_t)((hv(p[2]) << 4) | hv(p[3]));
+        return 2;
+    }
+    return 1;
+}
+
+static void obdPollingTask(void* /*arg*/) {
+    WiFiClient obd;
+    String     connectedIp;
+    bool       initialized  = false;
+    size_t     highIdx = 0, lowIdx = 0;
+    int        stepCtr      = 0;
+    uint32_t   lastDiscovery = 0;
+
+    for (;;) {
+        xSemaphoreTake(cacheMutex, portMAX_DELAY);
+        String ip = discoveredObdIp;
+        xSemaphoreGive(cacheMutex);
+
+        // Self-rediscovery: if no IP, retry every 10s.
+        if (ip.isEmpty()) {
+            if (millis() - lastDiscovery > 10000) {
+                lastDiscovery = millis();
+                discoverObdAdapter();
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+            continue;
+        }
+
+        // (Re)connect if the IP changed or the socket died.
+        if (!obd.connected() || ip != connectedIp) {
+            obd.stop();
+            initialized = false;
+            connectedIp = ip;
+            Serial.printf("[OBD] Connecting to %s:%u...\n", connectedIp.c_str(), OBD_PORT);
+            if (!obd.connect(connectedIp.c_str(), OBD_PORT)) {
+                Serial.println("[OBD] Connect failed -- clearing IP for rediscovery.");
+                xSemaphoreTake(cacheMutex, portMAX_DELAY);
+                discoveredObdIp = "";
+                for (size_t i = 0; i < kObdPidCount; ++i) pidCache[i].valid = false;
+                xSemaphoreGive(cacheMutex);
+                connectedIp = "";
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                continue;
+            }
+            Serial.println("[OBD] Connected.");
+        }
+
+        // ELM327 initialisation (once per TCP connection).
+        if (!initialized) {
+            const char* initCmds[] = {"ATZ", "ATE0", "ATL0", "ATS0", "ATH0"};
+            bool ok = true;
+            for (const char* cmd : initCmds) {
+                String resp;
+                ok = elmSend(obd, cmd, resp, 3000);
+                if (VERBOSE_LOG && ok)
+                    Serial.printf("[OBD init] %s -> %s\n", cmd, resp.c_str());
+                if (!ok) break;
+            }
+            if (!ok) {
+                Serial.println("[OBD] Init failed, reconnecting...");
+                obd.stop();
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+            initialized = true;
+            Serial.println("[OBD] Ready. Updating cache...");
+        }
+
+        // Weighted PID selection: 2 high-priority per 1 low-priority. Skips PIDs already
+        // confirmed unsupported so the ECU round trip goes to something that answers.
+        size_t pidIdx;
+        bool   foundPid = false;
+        if ((stepCtr % 3) == 0) {
+            for (size_t attempt = 0; attempt < kLowCount; ++attempt) {
+                size_t candidate = kHighCount + (lowIdx % kLowCount);
+                ++lowIdx;
+                if (pidSupported[candidate]) { pidIdx = candidate; foundPid = true; break; }
+            }
+        } else {
+            for (size_t attempt = 0; attempt < kHighCount; ++attempt) {
+                size_t candidate = highIdx % kHighCount;
+                ++highIdx;
+                if (pidSupported[candidate]) { pidIdx = candidate; foundPid = true; break; }
+            }
+        }
+        ++stepCtr;
+        if (!foundPid) {
+            // Every PID in this tier is unsupported; nothing to poll this step.
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        const ObdPid& pid = kObdPids[pidIdx];
+        char cmd[8];
+        snprintf(cmd, sizeof(cmd), "01%s", pid.hex);
+
+        String resp;
+        if (!elmSend(obd, cmd, resp, 2000)) {
+            Serial.printf("[OBD] No response for PID %s -- connection lost.\n", pid.hex);
+            obd.stop();
+            initialized = false;
+            xSemaphoreTake(cacheMutex, portMAX_DELAY);
+            discoveredObdIp = "";
+            for (size_t i = 0; i < kObdPidCount; ++i) pidCache[i].valid = false;
+            xSemaphoreGive(cacheMutex);
+            connectedIp = "";
+            continue;
+        }
+
+        if (VERBOSE_LOG) {
+            String r = resp;
+            r.replace("\r", "\\r");
+            r.replace("\n", "\\n");
+            Serial.printf("[cache %s] %s\n", pid.hex, r.c_str());
+        }
+
+        bool noData = (resp.indexOf("NO DATA") >= 0 || resp.indexOf("NODATA") >= 0 ||
+                       resp.indexOf("ERROR")   >= 0);
+
+        xSemaphoreTake(cacheMutex, portMAX_DELAY);
+        if (noData) {
+            pidCache[pidIdx].valid = false;
+            if (++pidNoDataStreak[pidIdx] >= kAutoDisableThreshold && pidSupported[pidIdx]) {
+                pidSupported[pidIdx] = false;
+                Serial.printf("[OBD] PID %s got NO DATA %d times -- marking unsupported, "
+                              "skipping it from now on.\n", pid.hex, kAutoDisableThreshold);
+            }
+        } else {
+            pidNoDataStreak[pidIdx] = 0;
+            uint8_t bytes[2] = {0, 0};
+            if (parseObdBytes(resp, pid.hex, bytes) > 0) {
+                pidCache[pidIdx].b[0]  = bytes[0];
+                pidCache[pidIdx].b[1]  = bytes[1];
+                pidCache[pidIdx].valid = true;
+                pidCache[pidIdx].ts    = millis();
+            }
+        }
+        xSemaphoreGive(cacheMutex);
+        // No explicit delay: the ECU round-trip is the natural rate limiter.
+    }
+}
+
+
+// ---- 3DS ELM327 emulator (answers instantly from cache) -----------------------
+
+static String buildPidResponse(const char* pidHex) {
+    int slot = -1;
+    for (int i = 0; i < (int)kObdPidCount; ++i) {
+        if (strcmp(kObdPids[i].hex, pidHex) == 0) { slot = i; break; }
+    }
+    if (slot < 0) return "NO DATA\r\r>";
+
+    xSemaphoreTake(cacheMutex, portMAX_DELAY);
+    CacheSlot e = pidCache[slot];
+    xSemaphoreGive(cacheMutex);
+
+    if (!e.valid || (millis() - e.ts) > CACHE_STALE_MS) return "NO DATA\r\r>";
+
+    char buf[32];
+    if (kObdPids[slot].word)
+        snprintf(buf, sizeof(buf), "41 %s %02X %02X\r\r>", pidHex, e.b[0], e.b[1]);
+    else
+        snprintf(buf, sizeof(buf), "41 %s %02X\r\r>",      pidHex, e.b[0]);
+    return String(buf);
+}
+
+static void handle3dsClient(WiFiClient& client) {
+    Serial.printf("[3DS] Connected from %s\n", client.remoteIP().toString().c_str());
+
+    String   cmdBuf;
+    uint32_t lastActivity       = millis();
+    size_t   pidQueriesAnswered = 0;
+
+    while (client.connected()) {
+        while (client.available()) {
+            char c = (char)client.read();
+            lastActivity = millis();
+
+            if (c == '\r' || c == '\n') {
+                cmdBuf.trim();
+                if (cmdBuf.isEmpty()) { cmdBuf = ""; continue; }
+
+                String upper = cmdBuf;
+                upper.toUpperCase();
+                if (VERBOSE_LOG) Serial.printf("[3DS->ESP] %s\n", upper.c_str());
+
+                String response;
+                if (upper == "ATZ") {
+                    response = "ELM327 v1.5\r\r>";
+                } else if (upper.startsWith("AT")) {
+                    response = "OK\r\r>";
+                } else if (upper.startsWith("01") && upper.length() >= 4) {
+                    String pidHex = upper.substring(2, 4);
+                    response = buildPidResponse(pidHex.c_str());
+                    ++pidQueriesAnswered;
+                } else {
+                    response = "?\r\r>";
+                }
+
+                if (VERBOSE_LOG) Serial.printf("[ESP->3DS] %s\n", response.c_str());
+                client.print(response);
+                cmdBuf = "";
+            } else {
+                cmdBuf += c;
+            }
+        }
+
+        if (millis() - lastActivity > 10000) {
+            Serial.println("[3DS] Idle timeout.");
+            break;
+        }
+
+        dnsServer.processNextRequest();
+        captivePortal.handleClient();
+        delay(1);
+    }
+
+    Serial.printf("[3DS] Disconnected after %u PID queries.\n", (unsigned)pidQueriesAnswered);
+    client.stop();
+}
+
+
+// ---- setup / loop -------------------------------------------------------------
 
 void setup() {
-  Serial.begin(115200);
-  delay(200);
-  Serial.println();
-  Serial.println("==== 3DS AutoUI ESP32 bridge ====");
+    Serial.begin(115200);
+    delay(200);
+    Serial.println();
+    Serial.println("==== 3DS AutoUI ESP32 bridge (cache mode) ====");
 
-  WiFi.mode(WIFI_AP);
-  startAccessPoint();
+    cacheMutex = xSemaphoreCreateMutex();
+    memset(pidCache, 0, sizeof(pidCache));
+    for (size_t i = 0; i < kObdPidCount; ++i) { pidSupported[i] = true; pidNoDataStreak[i] = 0; }
 
-  // Give V-LINK a few seconds to auto-associate and grab a DHCP lease before the
-  // first discovery pass.
-  delay(3000);
-  discoverObdAdapter();
+    WiFi.mode(WIFI_AP);
+    startAccessPoint();
 
-  proxyServer.begin();
-  proxyServer.setNoDelay(true);
-  Serial.printf("[proxy] Listening on %s:%u\n",
-                WiFi.softAPIP().toString().c_str(), LISTEN_PORT);
+    // Give V-LINK time to join the AP and obtain a DHCP lease before scanning.
+    delay(3000);
+    discoverObdAdapter();
+
+    // Start background OBD polling on Core 0 (Wi-Fi/lwIP also lives on Core 0).
+    xTaskCreatePinnedToCore(obdPollingTask, "obdPoll", 8192, nullptr, 1, nullptr, 0);
+
+    proxyServer.begin();
+    proxyServer.setNoDelay(true);
+    Serial.printf("[3DS server] Listening on %s:%u\n",
+                  WiFi.softAPIP().toString().c_str(), LISTEN_PORT);
 }
 
 void loop() {
-  // Keep retrying discovery in the background until the adapter is found.
-  if (discoveredObdIp.isEmpty()) {
-    static uint32_t lastDiscoveryAttempt = 0;
-    if (millis() - lastDiscoveryAttempt > 10000) {
-      lastDiscoveryAttempt = millis();
-      discoverObdAdapter();
+    static uint32_t lastHeartbeat = 0;
+    if (millis() - lastHeartbeat > 5000) {
+        lastHeartbeat = millis();
+        xSemaphoreTake(cacheMutex, portMAX_DELAY);
+        String ip = discoveredObdIp;
+        xSemaphoreGive(cacheMutex);
+        int unsupportedCount = 0;
+        for (size_t i = 0; i < kObdPidCount; ++i) if (!pidSupported[i]) ++unsupportedCount;
+        Serial.printf("[status] AP clients:%d  OBD:%s  unsupported PIDs:%d/%d  heap:%u\n",
+                      WiFi.softAPgetStationNum(),
+                      ip.isEmpty() ? "searching..." : ip.c_str(),
+                      unsupportedCount, (int)kObdPidCount,
+                      (unsigned)ESP.getFreeHeap());
     }
-  }
 
-  // Heartbeat so you can confirm the AP and adapter link are alive without a 3DS session open.
-  static uint32_t lastHeartbeat = 0;
-  if (millis() - lastHeartbeat > 5000) {
-    lastHeartbeat = millis();
-    Serial.printf("[status] AP clients:%d OBD:%s heap:%u\n",
-                  WiFi.softAPgetStationNum(),
-                  discoveredObdIp.isEmpty() ? "not found" : discoveredObdIp.c_str(),
-                  (unsigned)ESP.getFreeHeap());
-  }
+    dnsServer.processNextRequest();
+    captivePortal.handleClient();
 
-  dnsServer.processNextRequest();
-  captivePortal.handleClient();
-
-  WiFiClient client = proxyServer.available();
-  if (client) {
-    client.setNoDelay(true);
-    runProxySession(client);
-  }
+    WiFiClient client = proxyServer.available();
+    if (client) {
+        client.setNoDelay(true);
+        handle3dsClient(client);
+    }
 }

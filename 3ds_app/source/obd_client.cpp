@@ -6,6 +6,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 
@@ -90,6 +91,14 @@ const PidSpec kPollPids[] = {
     {"5C", "oil_temp", false, 1.0f, -40.0f},
 };
 
+// Indices into kPollPids. Fast-changing gauges (rpm/speed/boost/throttle) are polled
+// twice as often as slow-changing ones (temps/fuel/voltage) so the responsive gauges
+// don't wait behind a full round-robin of everything else.
+const size_t kHighPriorityIdx[] = {0, 1, 4, 5};   // rpm, speed, boost, throttle_position
+const size_t kLowPriorityIdx[] = {2, 3, 6, 7, 8, 9};  // coolant, intake, load, fuel, voltage, oil_temp
+const size_t kHighPriorityCount = sizeof(kHighPriorityIdx) / sizeof(kHighPriorityIdx[0]);
+const size_t kLowPriorityCount = sizeof(kLowPriorityIdx) / sizeof(kLowPriorityIdx[0]);
+
 std::string formatSocketError(const char* prefix, int err) {
     char text[160];
     const char* reason = strerror(err);
@@ -131,7 +140,9 @@ void ObdClient::disconnect() {
 bool ObdClient::connectToAdapter() {
     disconnect();
     error_.clear();
-    pollIndex_ = 0;
+    highIndex_ = 0;
+    lowIndex_ = 0;
+    stepCounter_ = 0;
     consecutiveFail_ = 0;
     commLost_ = false;
 
@@ -149,6 +160,12 @@ bool ObdClient::connectToAdapter() {
         setError(detail);
         return false;
     }
+
+    // Disable Nagle's algorithm: this protocol is a tiny request/reply ping-pong
+    // (5-byte commands), and Nagle + delayed ACK on either end can add tens of ms
+    // of invisible latency per query, which compounds badly across a polling cycle.
+    int nodelay = 1;
+    setsockopt(socket_, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -328,8 +345,32 @@ bool ObdClient::pollStep(std::vector<GaugeSample>& samples, bool& connectionLost
     }
 
     const size_t pidCount = sizeof(kPollPids) / sizeof(kPollPids[0]);
-    const PidSpec& spec = kPollPids[pollIndex_];
-    pollIndex_ = (pollIndex_ + 1) % pidCount;
+
+    // Every 3rd step polls the next low-priority PID; the other 2 out of 3 poll the
+    // next high-priority PID. That gives high-priority gauges ~2x the refresh rate
+    // without adding extra queries per second overall. Disabled/unsupported PIDs are
+    // skipped without sending anything, freeing that slot for the next enabled one.
+    size_t pidIndex = 0;
+    bool found = false;
+    if ((stepCounter_ % 3) == 0) {
+        for (size_t attempt = 0; attempt < kLowPriorityCount; ++attempt) {
+            size_t candidate = kLowPriorityIdx[lowIndex_];
+            lowIndex_ = (lowIndex_ + 1) % kLowPriorityCount;
+            if (pidEnabled_[candidate]) { pidIndex = candidate; found = true; break; }
+        }
+    } else {
+        for (size_t attempt = 0; attempt < kHighPriorityCount; ++attempt) {
+            size_t candidate = kHighPriorityIdx[highIndex_];
+            highIndex_ = (highIndex_ + 1) % kHighPriorityCount;
+            if (pidEnabled_[candidate]) { pidIndex = candidate; found = true; break; }
+        }
+    }
+    ++stepCounter_;
+    if (!found) {
+        // Every PID in this priority tier is disabled/unsupported right now; nothing to do.
+        return true;
+    }
+    const PidSpec& spec = kPollPids[pidIndex];
 
     commLost_ = false;
     std::string response;
@@ -350,9 +391,16 @@ bool ObdClient::pollStep(std::vector<GaugeSample>& samples, bool& connectionLost
     }
     if (gotValue) {
         consecutiveFail_ = 0;
+        pidNoDataStreak_[pidIndex] = 0;
     } else {
         // Unsupported PID (NODATA) or parse miss: hide the gauge rather than show a stale value.
         markInvalid(samples, spec.id);
+        // After enough consecutive misses the vehicle almost certainly doesn't support this
+        // PID at all (e.g. no boost/MAP sensor) -- stop wasting round trips asking for it.
+        static constexpr int kAutoDisableThreshold = 8;
+        if (++pidNoDataStreak_[pidIndex] >= kAutoDisableThreshold) {
+            pidEnabled_[pidIndex] = false;
+        }
         if (++consecutiveFail_ >= static_cast<int>(pidCount)) {
             // A full cycle with nothing readable means the adapter/link is effectively gone.
             connectionLost = true;
@@ -361,4 +409,15 @@ bool ObdClient::pollStep(std::vector<GaugeSample>& samples, bool& connectionLost
         }
     }
     return true;
+}
+
+void ObdClient::setPidEnabled(const char* gaugeId, bool enabled) {
+    const size_t pidCount = sizeof(kPollPids) / sizeof(kPollPids[0]);
+    for (size_t i = 0; i < pidCount; ++i) {
+        if (strcmp(kPollPids[i].id, gaugeId) == 0) {
+            pidEnabled_[i] = enabled;
+            if (enabled) pidNoDataStreak_[i] = 0;  // give a re-enabled gauge a fresh chance
+            return;
+        }
+    }
 }

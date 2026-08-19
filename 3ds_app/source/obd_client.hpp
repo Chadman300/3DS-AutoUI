@@ -32,6 +32,12 @@ public:
     bool pollStep(std::vector<GaugeSample>& samples, bool& connectionLost);
     void setError(const std::string& message);
 
+    // Enables/disables polling for one gauge by id (e.g. "boost"). Disabled gauges are
+    // skipped entirely by pollStep -- no network round trip is made for them. Call this
+    // when the user hides a gauge in settings. PIDs the vehicle never answers (unsupported)
+    // get auto-disabled the same way after repeated NO DATA responses.
+    void setPidEnabled(const char* gaugeId, bool enabled);
+
 private:
     bool sendCommand(const char* command, std::string& response);
     bool queryPid(const char* pid, std::string& response);
@@ -41,7 +47,14 @@ private:
     ObdConnectionConfig config_;
     int socket_ = -1;
     std::string error_;
-    size_t pollIndex_ = 0;
+    size_t highIndex_ = 0;
+    size_t lowIndex_ = 0;
+    int stepCounter_ = 0;
     int consecutiveFail_ = 0;
     bool commLost_ = false;
+
+    // Indexed the same as the internal PID table (10 entries). true = still polled.
+    static constexpr size_t kMaxPollPids = 10;
+    bool pidEnabled_[kMaxPollPids] = {true, true, true, true, true, true, true, true, true, true};
+    int pidNoDataStreak_[kMaxPollPids] = {0};
 };

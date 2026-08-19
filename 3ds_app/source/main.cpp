@@ -253,7 +253,9 @@ static void netThreadMain(void* arg) {
             }
             LightLock_Unlock(&nt->lock);
             if (!ok && lost) nt->obd->disconnect();
-            svcSleepThread(15 * 1000000LL); // brief gap between PIDs
+            // The ESP32 cache answers near-instantly, so this only needs to yield the
+            // thread, not throttle for a slow physical adapter anymore.
+            svcSleepThread(3 * 1000000LL);
         } else {
             svcSleepThread(120 * 1000000LL); // idle while disconnected
         }
@@ -330,6 +332,12 @@ int main(int argc, char** argv) {
     obdConfig.port = static_cast<u16>(settings.port);
     ObdClient obd(obdConfig);
 
+    // Hidden gauges don't need live data at all -- skip polling them so their PID slot
+    // goes to gauges the user actually has on screen.
+    for (size_t i = 0; i < dashboard.gauges.size() && i < 10; ++i) {
+        obd.setPidEnabled(dashboard.gauges[i].id.c_str(), settings.visible[i]);
+    }
+
     // All socket I/O runs on a background thread so the render loop never blocks on the adapter.
     NetThread net;
     LightLock_Init(&net.lock);
@@ -382,7 +390,12 @@ int main(int argc, char** argv) {
         if (keys & KEY_RIGHT) selectedGauge = (selectedGauge + 1) % dashboard.gauges.size();
         if (!liveMode && (keys & (KEY_UP | KEY_CPAD_UP))) errorScroll = std::max(0.0f, errorScroll - 32.0f);
         if (!liveMode && (keys & (KEY_DOWN | KEY_CPAD_DOWN))) errorScroll += 32.0f;
-        if (!confirmRevert && (keys & KEY_A)) settings.visible[selectedGauge] = !settings.visible[selectedGauge];
+        if (!confirmRevert && (keys & KEY_A)) {
+            settings.visible[selectedGauge] = !settings.visible[selectedGauge];
+            if (selectedGauge < dashboard.gauges.size()) {
+                obd.setPidEnabled(dashboard.gauges[selectedGauge].id.c_str(), settings.visible[selectedGauge]);
+            }
+        }
         if (keys & KEY_X) {
             static const unsigned int backgrounds[] = {0x0B1220, 0x101010, 0x18212B, 0x22141A};
             settings.theme = (settings.theme + 1) % 4;
