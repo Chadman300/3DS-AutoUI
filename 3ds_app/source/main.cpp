@@ -104,48 +104,133 @@ static std::string detectLocalIp(bool networkReady, const ObdConnectionConfig& c
 }
 
 static bool handleTouch(touchPosition& touch, DashboardData& dashboard, GuiSettings& settings,
-                        size_t& selectedGauge, bool& confirmRevert, int& draggingGauge) {
+                        size_t& selectedGauge, bool& confirmRevert, int& draggingGauge,
+                        bool liveMode, bool& showConnectionError) {
     hidTouchRead(&touch);
     if (confirmRevert) return true;
 
-    if (touch.py < 36 && touch.px >= 190 && touch.px < 250) {
-        settings.editMode = !settings.editMode;
-        draggingGauge = -1;
-        return true;
-    }
-    if (touch.py < 36 && touch.px >= 250) {
-        confirmRevert = true;
-        return true;
-    }
-
-    if (settings.editMode) {
-        for (size_t index = 0; index < dashboard.gauges.size(); ++index) {
-            const float x = settings.x[index] * 0.78f;
-            const float y = settings.y[index];
-            const float width = index < 2 ? 110.0f : 90.0f;
-            const float height = index < 2 ? 48.0f : 34.0f;
-            if (touch.px >= x && touch.px <= x + width && touch.py >= y && touch.py <= y + height) {
-                selectedGauge = index;
-                draggingGauge = static_cast<int>(index);
-                return true;
-            }
-        }
-        if (draggingGauge >= 0) {
-            settings.x[draggingGauge] = std::max(0.0f, std::min(390.0f, touch.px / 0.78f));
-            settings.y[draggingGauge] = std::max(42.0f, std::min(205.0f, static_cast<float>(touch.py)));
+    if (!liveMode && showConnectionError) {
+        if (touch.px < 56 && touch.py < 48) {
+            showConnectionError = false;
             return true;
         }
         return false;
     }
 
+    if (touch.py < 42 && touch.px >= 200 && touch.px < 255) {
+        if (!liveMode) showConnectionError = true;
+        return true;
+    }
+
+    if (touch.py < 36 && touch.px >= 150 && touch.px < 200) {
+        settings.editMode = !settings.editMode;
+        draggingGauge = -1;
+        return true;
+    }
+    if (touch.py < 36 && touch.px >= 255) {
+        confirmRevert = true;
+        return true;
+    }
+
+    if (settings.editMode) {
+        constexpr float EDIT_SCALE = 0.58f;
+        constexpr float EDIT_OFFSET_X = 10.0f;
+        constexpr float EDIT_OFFSET_Y = 42.0f;
+
+        // Toolbar: scale slider minus button (y=192-210, x=8-26)
+        if (touch.py >= 192 && touch.py <= 210 && touch.px >= 8 && touch.px < 26) {
+            if (settings.bannerSelected) {
+                settings.bannerScale = std::max(0.5f, settings.bannerScale - 0.1f);
+            } else {
+                settings.scale[selectedGauge] = std::max(0.5f, settings.scale[selectedGauge] - 0.1f);
+            }
+            return true;
+        }
+        // Toolbar: scale slider plus button (y=192-210, x=128-146)
+        if (touch.py >= 192 && touch.py <= 210 && touch.px >= 128 && touch.px < 146) {
+            if (settings.bannerSelected) {
+                settings.bannerScale = std::min(2.0f, settings.bannerScale + 0.1f);
+            } else {
+                settings.scale[selectedGauge] = std::min(2.0f, settings.scale[selectedGauge] + 0.1f);
+            }
+            return true;
+        }
+        // Toolbar: scale slider track drag (y=196-208, x=30-126)
+        if (touch.py >= 196 && touch.py <= 208 && touch.px >= 30 && touch.px <= 126) {
+            float newScale = 0.5f + 1.5f * static_cast<float>(touch.px - 30) / 96.0f;
+            newScale = std::max(0.5f, std::min(2.0f, newScale));
+            if (settings.bannerSelected) settings.bannerScale = newScale;
+            else settings.scale[selectedGauge] = newScale;
+            return true;
+        }
+        // Toolbar: visibility toggle (y=192-210, x=174-234)
+        if (touch.py >= 192 && touch.py <= 210 && touch.px >= 174 && touch.px <= 234) {
+            if (settings.bannerSelected) settings.bannerVisible = !settings.bannerVisible;
+            else settings.visible[selectedGauge] = !settings.visible[selectedGauge];
+            return true;
+        }
+        // Toolbar: dial/bar toggle (y=192-210, x=240-300), not for banner
+        if (!settings.bannerSelected && touch.py >= 192 && touch.py <= 210 && touch.px >= 240 && touch.px <= 300) {
+            settings.dial[selectedGauge] = !settings.dial[selectedGauge];
+            return true;
+        }
+
+        // If already dragging, keep moving the same element (prevents switching on overlap)
+        if (draggingGauge == -2) {
+            settings.bannerX = std::max(0.0f, std::min(390.0f,
+                (static_cast<float>(touch.px) - EDIT_OFFSET_X) / EDIT_SCALE));
+            settings.bannerY = std::max(0.0f, std::min(205.0f,
+                (static_cast<float>(touch.py) - EDIT_OFFSET_Y) / EDIT_SCALE));
+            return true;
+        }
+        if (draggingGauge >= 0) {
+            settings.x[draggingGauge] = std::max(0.0f, std::min(390.0f,
+                (static_cast<float>(touch.px) - EDIT_OFFSET_X) / EDIT_SCALE));
+            settings.y[draggingGauge] = std::max(0.0f, std::min(205.0f,
+                (static_cast<float>(touch.py) - EDIT_OFFSET_Y) / EDIT_SCALE));
+            return true;
+        }
+
+        // Banner hit test (center-based)
+        {
+            const float bw = 384.0f * settings.bannerScale * EDIT_SCALE;
+            const float bh = 38.0f * settings.bannerScale * EDIT_SCALE;
+            const float bx = settings.bannerX * EDIT_SCALE + EDIT_OFFSET_X - bw * 0.5f;
+            const float by = settings.bannerY * EDIT_SCALE + EDIT_OFFSET_Y - bh * 0.5f;
+            if (touch.px >= bx && touch.px <= bx + bw && touch.py >= by && touch.py <= by + bh) {
+                settings.bannerSelected = true;
+                draggingGauge = -2;
+                return true;
+            }
+        }
+
+        // Gauge box hit tests (center-based)
+        for (size_t index = 0; index < dashboard.gauges.size(); ++index) {
+            const float s = settings.scale[index];
+            const float baseW = index < 2 ? 188.0f : 92.0f;
+            const float baseH = index < 2 ? 78.0f : 43.0f;
+            const float w = baseW * s * EDIT_SCALE;
+            const float h = baseH * s * EDIT_SCALE;
+            const float x = settings.x[index] * EDIT_SCALE + EDIT_OFFSET_X - w * 0.5f;
+            const float y = settings.y[index] * EDIT_SCALE + EDIT_OFFSET_Y - h * 0.5f;
+            if (touch.px >= x && touch.px <= x + w && touch.py >= y && touch.py <= y + h) {
+                selectedGauge = index;
+                settings.bannerSelected = false;
+                draggingGauge = static_cast<int>(index);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Non-edit mode: gauge selection + color picker (no dial toggle here)
     if (touch.py >= 58 && touch.py < 158) {
         const size_t row = static_cast<size_t>(touch.py - 58) / 25;
         const size_t column = touch.px >= 160 ? 1 : 0;
         const size_t index = row * 2 + column;
         if (index < dashboard.gauges.size()) {
             selectedGauge = index;
-            const unsigned int cardX = column == 0 ? 10 : 164;
-            if (touch.px >= cardX + 86) settings.dial[index] = !settings.dial[index];
             return true;
         }
     }
@@ -193,10 +278,50 @@ struct NetThread {
     std::vector<GaugeSample> samples;
     char localIp[24] = "unknown";
     char error[256] = "";
+    char vehicleBrand[24] = "";
+    char vehicleName[48] = "";
+    volatile bool vinReady = false;
     volatile bool running = true;
     volatile bool live = false;
+    volatile bool initialConnectionComplete = false;
     volatile bool reconnectRequested = false;
 };
+
+// Decodes the model year from VIN position 10 (0 if unknown).
+static int vinModelYear(char c) {
+    if (c >= '1' && c <= '9') return 2000 + (c - '0');
+    switch (c) {
+        case 'A': return 2010; case 'B': return 2011; case 'C': return 2012;
+        case 'D': return 2013; case 'E': return 2014; case 'F': return 2015;
+        case 'G': return 2016; case 'H': return 2017; case 'J': return 2018;
+        case 'K': return 2019; case 'L': return 2020; case 'M': return 2021;
+        case 'N': return 2022; case 'P': return 2023; case 'R': return 2024;
+        case 'S': return 2025; case 'T': return 2026; case 'V': return 2027;
+        case 'W': return 2028; case 'X': return 2029; case 'Y': return 2030;
+    }
+    return 0;
+}
+
+// Maps the VIN's World Manufacturer Identifier (first 3 chars) to a make name.
+static std::string vinMake(const std::string& vin) {
+    if (vin.size() < 3) return "VEHICLE";
+    const std::string w = vin.substr(0, 3);
+    const std::string w2 = vin.substr(0, 2);
+    if (w == "JF1" || w == "JF2" || w == "4S3" || w == "4S4") return "SUBARU";
+    if (w2 == "1H" || w2 == "JH" || w == "2HG" || w == "3HG") return "HONDA";
+    if (w == "JTD" || w2 == "JT" || w2 == "4T" || w2 == "5T" || w2 == "2T") return "TOYOTA";
+    if (w2 == "1F" || w2 == "2F" || w2 == "3F") return "FORD";
+    if (w2 == "1G" || w == "KL1" || w2 == "2G" || w2 == "3G") return "GM";
+    if (w2 == "1N" || w2 == "JN" || w == "3N1" || w == "5N1") return "NISSAN";
+    if (w == "WBA" || w == "WBS" || w == "5UX" || w == "4US") return "BMW";
+    if (w == "WDB" || w == "WDD" || w == "WDC" || w == "4JG") return "MERCEDES";
+    if (w == "WVW" || w == "3VW" || w == "1VW" || w == "WVG") return "VOLKSWAGEN";
+    if (w == "WAU" || w == "TRU" || w == "WA1") return "AUDI";
+    if (w == "KMH" || w == "KMF" || w == "5NP") return "HYUNDAI";
+    if (w == "KND" || w == "5XY" || w == "KNA") return "KIA";
+    if (w == "JM1" || w == "JM3" || w2 == "4F") return "MAZDA";
+    return w; // unknown make: show the raw WMI
+}
 
 // Runs on the network thread only. Connects (with a couple of quick retries) and publishes
 // the result to shared state. Uses svcSleepThread for delays (never graphics calls).
@@ -225,11 +350,37 @@ static void netConnect(NetThread* nt) {
         buildAcDiag(nt->obd->lastError().c_str(), nt->error, sizeof(nt->error));
     }
     LightLock_Unlock(&nt->lock);
+
+    // Read and decode the VIN once per successful connect.
+    std::string brand;
+    std::string name;
+    bool gotVin = false;
+    if (live) {
+        std::string vin;
+        if (nt->obd->queryVin(vin)) {
+            brand = vinMake(vin);
+            const int year = vinModelYear(vin.size() >= 10 ? vin[9] : '0');
+            char buf[48];
+            if (year > 0) snprintf(buf, sizeof(buf), "%d  %s", year, vin.c_str());
+            else snprintf(buf, sizeof(buf), "%s", vin.c_str());
+            name = buf;
+            gotVin = true;
+        }
+    }
+
+    if (gotVin) {
+        LightLock_Lock(&nt->lock);
+        snprintf(nt->vehicleBrand, sizeof(nt->vehicleBrand), "%s", brand.c_str());
+        snprintf(nt->vehicleName, sizeof(nt->vehicleName), "%s", name.c_str());
+        nt->vinReady = true;
+        LightLock_Unlock(&nt->lock);
+    }
 }
 
 static void netThreadMain(void* arg) {
     NetThread* nt = static_cast<NetThread*>(arg);
     netConnect(nt);
+    nt->initialConnectionComplete = true;
     while (nt->running) {
         if (nt->reconnectRequested) {
             nt->reconnectRequested = false;
@@ -356,6 +507,9 @@ int main(int argc, char** argv) {
     bool confirmRevert = false;
     int draggingGauge = -1;
     float errorScroll = 0.0f;
+    bool showConnectionError = true;
+    bool previousLiveMode = false;
+    unsigned int loadingFrame = 0;
 
     while (aptMainLoop()) {
         hidScanInput();
@@ -373,7 +527,23 @@ int main(int argc, char** argv) {
         frameSamples = net.samples;
         snprintf(frameIp, sizeof(frameIp), "%s", net.localIp);
         snprintf(frameError, sizeof(frameError), "%s", net.error);
+        // Apply the scanned VIN (make + year + VIN) to the header once it's available.
+        if (net.vinReady) {
+            dashboard.brand = net.vehicleBrand;
+            dashboard.vehicleName = net.vehicleName;
+            net.vinReady = false;
+        }
         LightLock_Unlock(&net.lock);
+
+        const bool loading = !net.initialConnectionComplete;
+        if (loading) {
+            gui.drawLoading(loadingFrame++);
+            gspWaitForVBlank();
+            continue;
+        }
+
+        if (!liveMode && previousLiveMode) showConnectionError = true;
+        previousLiveMode = liveMode;
 
         // Capture revert state at frame start so B can't both cancel a revert and reconnect.
         const bool revertActive = confirmRevert;
@@ -431,7 +601,9 @@ int main(int argc, char** argv) {
             LightLock_Unlock(&net.lock);
             net.reconnectRequested = true;
         }
-        if ((keys & KEY_TOUCH || hidKeysHeld() & KEY_TOUCH) && handleTouch(touch, dashboard, settings, selectedGauge, confirmRevert, draggingGauge)) {
+        if ((keys & KEY_TOUCH || hidKeysHeld() & KEY_TOUCH) &&
+            handleTouch(touch, dashboard, settings, selectedGauge, confirmRevert, draggingGauge,
+                        liveMode, showConnectionError)) {
             settings.selected = static_cast<unsigned int>(selectedGauge);
             saveSettings(settings);
         }
@@ -442,7 +614,8 @@ int main(int argc, char** argv) {
         }
 
         if (guiMode) {
-            gui.draw(dashboard, frameSamples, settings, liveMode, selectedGauge, confirmRevert, frameError, frameIp, errorScroll);
+            gui.draw(dashboard, frameSamples, settings, liveMode, selectedGauge, confirmRevert,
+                     showConnectionError, frameError, frameIp, errorScroll);
         }
         else {
             renderFallback(bottomConsole, dashboard, frameSamples, "citro2d initialization failed");

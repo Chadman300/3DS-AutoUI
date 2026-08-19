@@ -78,13 +78,17 @@ struct PidSpec {
     float offset;
 };
 
-const PidSpec kPollPids[] = {
+const PidSpec kFastPollPids[] = {
     {"0C", "rpm", true, 0.25f, 0.0f},
     {"0D", "speed", false, 1.0f, 0.0f},
+    {"0B", "boost", false, 1.0f / 6.89476f, 0.0f},
+    {"11", "throttle_position", false, 100.0f / 255.0f, 0.0f},
+};
+
+const PidSpec kSlowPollPids[] = {
     {"05", "coolant_temp", false, 1.0f, -40.0f},
     {"0F", "intake_temp", false, 1.0f, -40.0f},
-    {"0B", "boost", false, 1.0f / 6.89476f, -101.3f / 6.89476f},
-    {"11", "throttle_position", false, 100.0f / 255.0f, 0.0f},
+    {"33", "__baro", false, 1.0f, 0.0f},
     {"04", "engine_load", false, 100.0f / 255.0f, 0.0f},
     {"2F", "fuel_level", false, 100.0f / 255.0f, 0.0f},
     {"42", "battery_voltage", true, 0.001f, 0.0f},
@@ -380,7 +384,15 @@ bool ObdClient::pollStep(std::vector<GaugeSample>& samples, bool& connectionLost
         const bool parsed = spec.word ? parseWord(response, spec.pid, 0, raw)
                                       : parseByte(response, spec.pid, 0, raw);
         if (parsed) {
-            assignSample(samples, spec.id, static_cast<float>(raw) * spec.scale + spec.offset);
+            if (strcmp(spec.id, "__baro") == 0) {
+                // Barometric pressure: the live zero reference for boost, not a gauge itself.
+                baroKpa_ = static_cast<float>(raw);
+            } else if (strcmp(spec.id, "boost") == 0) {
+                // Gauge boost = (manifold absolute - barometric) in psi.
+                assignSample(samples, "boost", (static_cast<float>(raw) - baroKpa_) / 6.89476f);
+            } else {
+                assignSample(samples, spec.id, static_cast<float>(raw) * spec.scale + spec.offset);
+            }
             gotValue = true;
         }
     }
